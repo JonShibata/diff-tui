@@ -37,6 +37,8 @@ pub struct App {
     pub selected_file: Option<String>,
     pub config: Config,
     pub needs_redraw: bool,
+    /// (rendered row index of a hunk start, hunk's new-file line) for the open diff.
+    hunk_markers: Vec<(usize, u32)>,
 }
 
 impl App {
@@ -69,6 +71,7 @@ impl App {
             selected_file: None,
             config,
             needs_redraw: false,
+            hunk_markers: Vec::new(),
         })
     }
 
@@ -371,6 +374,21 @@ impl App {
                         }
                     };
 
+                    // Pair each rendered hunk-separator rule row with the new-file
+                    // line of the hunk's first actual change (from the raw diff), in
+                    // order. Used by `e` to open the editor at the change in the hunk
+                    // currently in view.
+                    let starts = crate::git::hunk_first_change_lines(&file.path);
+                    self.hunk_markers = self
+                        .diff_lines
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, line)| is_rule_row(line))
+                        .map(|(i, _)| i)
+                        .zip(starts)
+                        .map(|(row, line_no)| (row.saturating_sub(1), line_no))
+                        .collect();
+
                     self.diff_scroll = 0;
                     self.screen = Screen::DiffView;
                 }
@@ -389,7 +407,26 @@ impl App {
         }
     }
 
+    /// File line to open the editor at: the first changed line of the hunk at the
+    /// top of the diff view. None when not viewing a diff or no hunks were detected.
+    fn current_hunk_line(&self) -> Option<u32> {
+        if self.screen != Screen::DiffView || self.hunk_markers.is_empty() {
+            return None;
+        }
+        let scroll = self.diff_scroll as usize;
+        let mut line = self.hunk_markers[0].1; // default to the first hunk
+        for &(row, line_no) in &self.hunk_markers {
+            if row <= scroll {
+                line = line_no;
+            } else {
+                break;
+            }
+        }
+        Some(line)
+    }
+
     fn open_in_editor(&mut self) {
+        let line = self.current_hunk_line();
         if let Some(ref file_path) = self.selected_file {
             let editor_config = &self.config.editor;
             let command = editor_config.get_command();
@@ -398,9 +435,13 @@ impl App {
             let _ = terminal::disable_raw_mode();
             let _ = crossterm::execute!(std::io::stdout(), terminal::LeaveAlternateScreen);
 
-            // Build and run the editor command
+            // Build and run the editor command. `+N` opens at a line for hx/vim/
+            // nano/emacs; harmless to omit when there's no hunk line.
             let mut cmd = std::process::Command::new(&command);
             cmd.args(&editor_config.args);
+            if let Some(n) = line {
+                cmd.arg(format!("+{n}"));
+            }
             cmd.arg(file_path);
             let _ = cmd.status();
 
@@ -415,4 +456,12 @@ impl App {
             self.needs_redraw = true;
         }
     }
+}
+
+/// True if a rendered row is a delta hunk-separator rule (a run of `─`),
+/// used to locate hunk boundaries in the rendered diff.
+fn is_rule_row(line: &Line) -> bool {
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    text.chars().filter(|&c| c == '─').count() >= 10
+        && text.chars().all(|c| c == '─' || c.is_whitespace())
 }
