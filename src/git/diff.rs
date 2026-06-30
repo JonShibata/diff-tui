@@ -60,19 +60,24 @@ fn try_tool(
         cmd.arg(arg_str);
     }
 
-    // Pipe diff through the tool
+    // Pipe diff through the tool. Feed stdin from a separate thread while the
+    // main thread drains stdout, or a large diff deadlocks: once the tool's
+    // output pipe fills (~64KB) it stops reading, and a single-threaded
+    // write_all of the whole diff then blocks forever on a full stdin pipe.
     let mut process = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|_| ())?;
 
-    if let Some(ref mut stdin) = process.stdin {
+    let mut stdin = process.stdin.take().ok_or(())?;
+    let writer = std::thread::spawn(move || {
         let _ = stdin.write_all(&diff_input);
-    }
-    process.stdin.take();
+        // `stdin` drops here, closing the pipe so the tool sees EOF.
+    });
 
     let output = process.wait_with_output().map_err(|_| ())?;
+    let _ = writer.join();
     Ok(output.stdout)
 }
 
