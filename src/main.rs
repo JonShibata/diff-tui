@@ -24,6 +24,7 @@ KEYBINDINGS:
         k/Up      Move to previous file
         Enter     View diff of selected file
         e         Open file in editor
+        c         Copy file path to clipboard
         /         Start search mode
         q         Quit
 
@@ -35,6 +36,7 @@ KEYBINDINGS:
         g/Home    Go to top
         G/End     Go to bottom
         e         Open file in editor
+        c         Copy file path to clipboard
         Esc       Return to file list
         q         Quit
 ")]

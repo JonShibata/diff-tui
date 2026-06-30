@@ -39,6 +39,8 @@ pub struct App {
     pub needs_redraw: bool,
     /// (rendered row index of a hunk start, hunk's new-file line) for the open diff.
     hunk_markers: Vec<(usize, u32)>,
+    /// Transient status line (e.g. "Copied: …"), cleared on the next keypress.
+    status_message: Option<String>,
 }
 
 impl App {
@@ -72,6 +74,7 @@ impl App {
             config,
             needs_redraw: false,
             hunk_markers: Vec::new(),
+            status_message: None,
         })
     }
 
@@ -169,9 +172,13 @@ impl App {
         let help_text = if self.search_mode {
             " Type to search | Enter: select | Esc: cancel "
         } else {
-            " j/k: move | Enter: view diff | e: edit | /: search | q: quit"
+            " j/k: move | Enter: view diff | e: edit | c: copy path | /: search | q: quit"
         };
-        let help = Paragraph::new(help_text).style(Style::default().fg(Color::DarkGray));
+        let (help_str, help_color) = match &self.status_message {
+            Some(msg) => (msg.clone(), Color::Green),
+            None => (help_text.to_string(), Color::DarkGray),
+        };
+        let help = Paragraph::new(help_str).style(Style::default().fg(help_color));
         frame.render_widget(help, help_area);
     }
 
@@ -202,13 +209,19 @@ impl App {
 
         let total_lines = self.diff_lines.len();
         let current_line = self.diff_scroll as usize + 1;
-        let help = Paragraph::new(format!(
-            " j/k: scroll | e: edit | w: wrap ({}) | Esc: back | q: quit | Line {}/{} ",
-            if self.wrap { "on" } else { "off" },
-            current_line.min(total_lines),
-            total_lines
-        ))
-        .style(Style::default().fg(Color::DarkGray));
+        let (help_str, help_color) = match &self.status_message {
+            Some(msg) => (msg.clone(), Color::Green),
+            None => (
+                format!(
+                    " j/k: scroll | e: edit | c: copy path | w: wrap ({}) | Esc: back | q: quit | Line {}/{} ",
+                    if self.wrap { "on" } else { "off" },
+                    current_line.min(total_lines),
+                    total_lines
+                ),
+                Color::DarkGray,
+            ),
+        };
+        let help = Paragraph::new(help_str).style(Style::default().fg(help_color));
         frame.render_widget(help, chunks[1]);
     }
 
@@ -218,6 +231,8 @@ impl App {
                 return Ok(());
             }
 
+            // Clear any transient status (e.g. "Copied: …") on the next keypress.
+            self.status_message = None;
             match self.screen {
                 Screen::FileList => self.handle_file_list_keys(key.code),
                 Screen::DiffView => self.handle_diff_view_keys(key.code),
@@ -261,6 +276,7 @@ impl App {
                     self.search_mode = true;
                 }
                 KeyCode::Char('e') => self.open_selected_in_editor(),
+                KeyCode::Char('c') => self.copy_current_path(),
                 KeyCode::Enter => self.open_diff(),
                 _ => {}
             }
@@ -299,9 +315,32 @@ impl App {
             KeyCode::Char('e') => {
                 self.open_in_editor();
             }
+            KeyCode::Char('c') => self.copy_current_path(),
             KeyCode::Char('w') => self.wrap = !self.wrap,
             _ => {}
         }
+    }
+
+    /// Copy the path of the highlighted file (file list) or the open file
+    /// (diff view) to the system clipboard, with a brief status confirmation.
+    fn copy_current_path(&mut self) {
+        let path = match self.screen {
+            Screen::DiffView => self.selected_file.clone(),
+            Screen::FileList => self
+                .list_state
+                .selected()
+                .and_then(|i| self.filtered_indices.get(i).copied())
+                .and_then(|idx| self.files.get(idx))
+                .map(|f| f.path.clone()),
+        };
+        let Some(path) = path else {
+            return;
+        };
+        self.status_message = Some(if copy_to_clipboard(&path) {
+            format!("Copied: {path}")
+        } else {
+            "Copy failed: no wl-copy/xclip/xsel found".to_string()
+        });
     }
 
     fn select_next(&mut self) {
@@ -464,4 +503,39 @@ fn is_rule_row(line: &Line) -> bool {
     let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
     text.chars().filter(|&c| c == '─').count() >= 10
         && text.chars().all(|c| c == '─' || c.is_whitespace())
+}
+
+/// Copy text to the system clipboard via the first available CLI tool.
+/// Mirrors the codebase's shell-out style (jj/delta/$EDITOR); no extra crate.
+fn copy_to_clipboard(text: &str) -> bool {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    // Candidates cover Wayland (wl-copy) and X11 (xclip/xsel).
+    let candidates: [(&str, &[&str]); 3] = [
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+    for (cmd, args) in candidates {
+        if which::which(cmd).is_err() {
+            continue;
+        }
+        let Ok(mut child) = Command::new(cmd)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        if child.wait().map(|s| s.success()).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
 }
