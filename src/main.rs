@@ -35,6 +35,7 @@ KEYBINDINGS:
         u/PgUp    Scroll up 20 lines
         g/Home    Go to top
         G/End     Go to bottom
+        n/N       Next / previous file
         e         Open file in editor
         c         Copy file path to clipboard
         Esc       Return to file list

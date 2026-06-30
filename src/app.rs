@@ -213,7 +213,7 @@ impl App {
             Some(msg) => (msg.clone(), Color::Green),
             None => (
                 format!(
-                    " j/k: scroll | e: edit | c: copy path | w: wrap ({}) | Esc: back | q: quit | Line {}/{} ",
+                    " j/k: scroll | n/N: next/prev file | e: edit | c: copy path | w: wrap ({}) | Esc: back | q: quit | Line {}/{} ",
                     if self.wrap { "on" } else { "off" },
                     current_line.min(total_lines),
                     total_lines
@@ -270,8 +270,8 @@ impl App {
         } else {
             match code {
                 KeyCode::Char('q') => self.running = false,
-                KeyCode::Char('j') | KeyCode::Down => self.select_next(),
-                KeyCode::Char('k') | KeyCode::Up => self.select_previous(),
+                KeyCode::Char('j') | KeyCode::Char('n') | KeyCode::Down => self.select_next(),
+                KeyCode::Char('k') | KeyCode::Char('N') | KeyCode::Up => self.select_previous(),
                 KeyCode::Char('/') => {
                     self.search_mode = true;
                 }
@@ -317,8 +317,21 @@ impl App {
             }
             KeyCode::Char('c') => self.copy_current_path(),
             KeyCode::Char('w') => self.wrap = !self.wrap,
+            KeyCode::Char('n') => self.show_adjacent_file(true),
+            KeyCode::Char('N') => self.show_adjacent_file(false),
             _ => {}
         }
+    }
+
+    /// From the diff view, move to the next/previous file in the list and load
+    /// its diff in place (staying in the diff view).
+    fn show_adjacent_file(&mut self, forward: bool) {
+        if forward {
+            self.select_next();
+        } else {
+            self.select_previous();
+        }
+        self.load_diff_for_selected();
     }
 
     /// Copy the path of the highlighted file (file list) or the open file
@@ -378,6 +391,16 @@ impl App {
     }
 
     fn open_diff(&mut self) {
+        if self.load_diff_for_selected() {
+            self.screen = Screen::DiffView;
+        }
+    }
+
+    /// Load the diff for the currently-selected list item into `diff_lines` and
+    /// hunk markers, resetting scroll. Does not change the active screen, so it
+    /// serves both opening a diff and switching files within the diff view.
+    /// Returns true if a file's diff was loaded.
+    fn load_diff_for_selected(&mut self) -> bool {
         if let Some(list_idx) = self.list_state.selected() {
             if let Some(&file_idx) = self.filtered_indices.get(list_idx) {
                 if let Some(file) = self.files.get(file_idx) {
@@ -429,10 +452,11 @@ impl App {
                         .collect();
 
                     self.diff_scroll = 0;
-                    self.screen = Screen::DiffView;
+                    return true;
                 }
             }
         }
+        false
     }
 
     fn open_selected_in_editor(&mut self) {
