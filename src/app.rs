@@ -172,7 +172,7 @@ impl App {
         let help_text = if self.search_mode {
             " Type to search | Enter: select | Esc: cancel "
         } else {
-            " j/k: move | Enter: view diff | e: edit | c: copy path | /: search | q: quit"
+            " j/k: move | l/Enter: view diff | e: edit | c: copy path | /: search | q: quit"
         };
         let (help_str, help_color) = match &self.status_message {
             Some(msg) => (msg.clone(), Color::Green),
@@ -213,7 +213,7 @@ impl App {
             Some(msg) => (msg.clone(), Color::Green),
             None => (
                 format!(
-                    " j/k: scroll | n/N: next/prev file | e: edit | c: copy path | w: wrap ({}) | Esc: back | q: quit | Line {}/{} ",
+                    " j/k: scroll | n/N: next/prev file | e: edit | c: copy path | w: wrap ({}) | h/Esc: back | q: quit | Line {}/{} ",
                     if self.wrap { "on" } else { "off" },
                     current_line.min(total_lines),
                     total_lines
@@ -277,7 +277,7 @@ impl App {
                 }
                 KeyCode::Char('e') => self.open_selected_in_editor(),
                 KeyCode::Char('c') => self.copy_current_path(),
-                KeyCode::Enter => self.open_diff(),
+                KeyCode::Enter | KeyCode::Char('l') => self.open_diff(),
                 _ => {}
             }
         }
@@ -288,7 +288,7 @@ impl App {
             KeyCode::Char('q') => {
                 self.running = false;
             }
-            KeyCode::Esc => {
+            KeyCode::Esc | KeyCode::Char('h') => {
                 self.screen = Screen::FileList;
                 self.diff_scroll = 0;
             }

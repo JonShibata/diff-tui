@@ -22,7 +22,7 @@ KEYBINDINGS:
     File List:
         j/Down    Move to next file
         k/Up      Move to previous file
-        Enter     View diff of selected file
+        l/Enter   View diff of selected file
         e         Open file in editor
         c         Copy file path to clipboard
         /         Start search mode
@@ -38,7 +38,7 @@ KEYBINDINGS:
         n/N       Next / previous file
         e         Open file in editor
         c         Copy file path to clipboard
-        Esc       Return to file list
+        h/Esc     Return to file list
         q         Quit
 ")]
 struct Cli {
