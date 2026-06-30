@@ -3,23 +3,25 @@ use std::process::{Command, Stdio};
 
 use crate::config::DiffConfig;
 
-pub fn get_diff(file_path: &str, width: u16, config: &DiffConfig) -> Vec<u8> {
+pub fn get_diff(file_path: &str, width: u16, config: &DiffConfig, selection: &[String]) -> Vec<u8> {
     match config.tool.as_str() {
         "auto" => {
-            // Try delta first, then fallback to git diff
-            if let Ok(output) = try_tool("delta", file_path, width, &["--width"]) {
+            // Try delta first, then fall back to jj's own colored diff
+            if let Ok(output) = try_tool("delta", file_path, width, &["--width"], selection) {
                 return output;
             }
-            try_git_diff(file_path).unwrap_or_else(|_| b"Failed to get diff".to_vec())
+            try_jj_color_diff(file_path, selection).unwrap_or_else(|_| b"Failed to get diff".to_vec())
         }
-        "git" => try_git_diff(file_path).unwrap_or_else(|_| b"Failed to get diff".to_vec()),
+        "jj" | "git" => {
+            try_jj_color_diff(file_path, selection).unwrap_or_else(|_| b"Failed to get diff".to_vec())
+        }
         tool => {
             // Try the specified tool
-            if let Ok(output) = try_tool(tool, file_path, width, &config.args) {
+            if let Ok(output) = try_tool(tool, file_path, width, &config.args, selection) {
                 return output;
             }
-            // Fallback to git diff
-            try_git_diff(file_path).unwrap_or_else(|_| b"Failed to get diff".to_vec())
+            // Fallback to jj's own colored diff
+            try_jj_color_diff(file_path, selection).unwrap_or_else(|_| b"Failed to get diff".to_vec())
         }
     }
 }
@@ -28,8 +30,8 @@ pub fn get_diff(file_path: &str, width: u16, config: &DiffConfig) -> Vec<u8> {
 /// +c,d @@` header's `c` points at the hunk's first line, which is usually leading
 /// context; here we walk the hunk body past that context to the first added (`+`)
 /// or removed (`-`) line so the editor jumps to the actual change, not the context.
-pub fn hunk_first_change_lines(file_path: &str) -> Vec<u32> {
-    let raw = get_git_diff_output(file_path).unwrap_or_default();
+pub fn hunk_first_change_lines(file_path: &str, selection: &[String]) -> Vec<u32> {
+    let raw = get_jj_diff_output(file_path, selection).unwrap_or_default();
     first_change_lines(&String::from_utf8_lossy(&raw))
 }
 
@@ -79,14 +81,15 @@ fn try_tool(
     file_path: &str,
     width: u16,
     extra_args: &[impl AsRef<str>],
+    selection: &[String],
 ) -> Result<Vec<u8>, ()> {
     // Check if the tool is available
     if which::which(tool_name).is_err() {
         return Err(());
     }
 
-    // Get git diff first
-    let diff_input = get_git_diff_output(file_path)?;
+    // Get the (uncolored) git-format diff first
+    let diff_input = get_jj_diff_output(file_path, selection)?;
 
     if diff_input.is_empty() {
         return Err(());
@@ -131,44 +134,28 @@ fn try_tool(
     Ok(output.stdout)
 }
 
-fn get_git_diff_output(file_path: &str) -> Result<Vec<u8>, ()> {
-    let output = Command::new("git")
-        .args(["diff", file_path])
-        .output()
-        .map_err(|_| ())?;
-
-    if !output.stdout.is_empty() {
-        return Ok(output.stdout);
-    }
-
-    // Try for untracked/new files
-    let output = Command::new("git")
-        .args(["diff", "--no-index", "/dev/null", file_path])
+/// Uncolored git-format diff for one file (jj disables color when piped).
+fn get_jj_diff_output(file_path: &str, selection: &[String]) -> Result<Vec<u8>, ()> {
+    let output = Command::new("jj")
+        .arg("diff")
+        .args(selection)
+        .arg("--git")
+        .arg("--")
+        .arg(file_path)
         .output()
         .map_err(|_| ())?;
 
     Ok(output.stdout)
 }
 
-fn try_git_diff(file_path: &str) -> Result<Vec<u8>, ()> {
-    let output = Command::new("git")
-        .args(["diff", "--color=always", file_path])
-        .output()
-        .map_err(|_| ())?;
-
-    if !output.stdout.is_empty() {
-        return Ok(output.stdout);
-    }
-
-    // Try for untracked/new files
-    let output = Command::new("git")
-        .args([
-            "diff",
-            "--color=always",
-            "--no-index",
-            "/dev/null",
-            file_path,
-        ])
+/// Fallback when no external diff tool is available: jj's own colored git-format diff.
+fn try_jj_color_diff(file_path: &str, selection: &[String]) -> Result<Vec<u8>, ()> {
+    let output = Command::new("jj")
+        .args(["--color=always", "diff"])
+        .args(selection)
+        .arg("--git")
+        .arg("--")
+        .arg(file_path)
         .output()
         .map_err(|_| ())?;
 

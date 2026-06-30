@@ -37,6 +37,8 @@ pub struct App {
     pub selected_file: Option<String>,
     pub config: Config,
     pub needs_redraw: bool,
+    repository: Repository,
+    selection: Vec<String>,
     /// (rendered row index of a hunk start, hunk's new-file line) for the open diff.
     hunk_markers: Vec<(usize, u32)>,
     /// Transient status line (e.g. "Copied: …"), cleared on the next keypress.
@@ -44,9 +46,9 @@ pub struct App {
 }
 
 impl App {
-    pub fn new() -> Result<Self> {
+    pub fn new(selection: Vec<String>) -> Result<Self> {
         let config = Config::load();
-        let repository = Repository::open_current_dir()?;
+        let repository = Repository::open(selection.clone())?;
         let files = repository.get_changed_files()?;
         let file_paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
         let filtered_indices: Vec<usize> = (0..files.len()).collect();
@@ -73,6 +75,8 @@ impl App {
             selected_file: None,
             config,
             needs_redraw: false,
+            repository,
+            selection,
             hunk_markers: Vec::new(),
             status_message: None,
         })
@@ -172,7 +176,7 @@ impl App {
         let help_text = if self.search_mode {
             " Type to search | Enter: select | Esc: cancel "
         } else {
-            " j/k: move | l/Enter: view diff | e: edit | c: copy path | /: search | q: quit"
+            " j/k: move | l/Enter: view diff | e: edit | c: copy path | /: search | r: reload | q: quit"
         };
         let (help_str, help_color) = match &self.status_message {
             Some(msg) => (msg.clone(), Color::Green),
@@ -213,7 +217,7 @@ impl App {
             Some(msg) => (msg.clone(), Color::Green),
             None => (
                 format!(
-                    " j/k: scroll | n/N: next/prev file | e: edit | c: copy path | w: wrap ({}) | h/Esc: back | q: quit | Line {}/{} ",
+                    " j/k: scroll | n/N: next/prev file | e: edit | c: copy path | w: wrap ({}) | r: reload | h/Esc: back | q: quit | Line {}/{} ",
                     if self.wrap { "on" } else { "off" },
                     current_line.min(total_lines),
                     total_lines
@@ -277,6 +281,7 @@ impl App {
                 }
                 KeyCode::Char('e') => self.open_selected_in_editor(),
                 KeyCode::Char('c') => self.copy_current_path(),
+                KeyCode::Char('r') => self.refresh(),
                 KeyCode::Enter | KeyCode::Char('l') => self.open_diff(),
                 _ => {}
             }
@@ -314,6 +319,9 @@ impl App {
             }
             KeyCode::Char('e') => {
                 self.open_in_editor();
+            }
+            KeyCode::Char('r') => {
+                self.refresh();
             }
             KeyCode::Char('c') => self.copy_current_path(),
             KeyCode::Char('w') => self.wrap = !self.wrap,
@@ -409,7 +417,8 @@ impl App {
                     let width = terminal::size()
                         .map(|(w, _)| w.saturating_sub(2))
                         .unwrap_or(80);
-                    self.diff_content = crate::git::get_diff(&file.path, width, &self.config.diff);
+                    self.diff_content =
+                        crate::git::get_diff(&file.path, width, &self.config.diff, &self.selection);
 
                     // Parse ANSI escape sequences into styled lines
                     self.diff_lines = match self.diff_content.as_slice().into_text() {
@@ -440,7 +449,7 @@ impl App {
                     // line of the hunk's first actual change (from the raw diff), in
                     // order. Used by `e` to open the editor at the change in the hunk
                     // currently in view.
-                    let starts = crate::git::hunk_first_change_lines(&file.path);
+                    let starts = crate::git::hunk_first_change_lines(&file.path, &self.selection);
                     self.hunk_markers = self
                         .diff_lines
                         .iter()
@@ -457,6 +466,47 @@ impl App {
             }
         }
         false
+    }
+
+    /// Re-derive the file list and current diff from jj (after an edit or `r`).
+    fn refresh(&mut self) {
+        let prev_path = self.selected_file.clone();
+        let prev_scroll = self.diff_scroll;
+
+        if let Ok(files) = self.repository.get_changed_files() {
+            self.file_paths = files.iter().map(|f| f.path.clone()).collect();
+            self.files = files;
+            self.update_filter();
+        }
+
+        // Restore the list selection to the same path if it still exists.
+        if let Some(path) = &prev_path {
+            if let Some(pos) = self.filtered_indices.iter().position(|&idx| {
+                self.files.get(idx).map(|f| f.path.as_str()) == Some(path.as_str())
+            }) {
+                self.list_state.select(Some(pos));
+            }
+        }
+
+        // If a diff is open, regenerate it; drop back to the list if the file is gone.
+        if self.screen == Screen::DiffView {
+            let still_present = prev_path
+                .as_ref()
+                .map(|p| self.files.iter().any(|f| &f.path == p))
+                .unwrap_or(false);
+            if still_present {
+                // load_diff_for_selected resets scroll to 0; restore the prior
+                // position (clamped) so a reload keeps the user where they were.
+                self.load_diff_for_selected();
+                let max_scroll = self.diff_lines.len().saturating_sub(1) as u16;
+                self.diff_scroll = prev_scroll.min(max_scroll);
+            } else {
+                self.screen = Screen::FileList;
+                self.diff_scroll = 0;
+            }
+        }
+
+        self.needs_redraw = true;
     }
 
     fn open_selected_in_editor(&mut self) {
@@ -490,34 +540,36 @@ impl App {
 
     fn open_in_editor(&mut self) {
         let line = self.current_hunk_line();
-        if let Some(ref file_path) = self.selected_file {
-            let editor_config = &self.config.editor;
-            let command = editor_config.get_command();
+        let Some(file_path) = self.selected_file.clone() else {
+            return;
+        };
+        let command = self.config.editor.get_command();
+        let editor_args = self.config.editor.args.clone();
 
-            // Temporarily exit TUI mode
-            let _ = terminal::disable_raw_mode();
-            let _ = crossterm::execute!(std::io::stdout(), terminal::LeaveAlternateScreen);
+        // Temporarily exit TUI mode
+        let _ = terminal::disable_raw_mode();
+        let _ = crossterm::execute!(std::io::stdout(), terminal::LeaveAlternateScreen);
 
-            // Build and run the editor command. `+N` opens at a line for hx/vim/
-            // nano/emacs; harmless to omit when there's no hunk line.
-            let mut cmd = std::process::Command::new(&command);
-            cmd.args(&editor_config.args);
-            if let Some(n) = line {
-                cmd.arg(format!("+{n}"));
-            }
-            cmd.arg(file_path);
-            let _ = cmd.status();
-
-            // Restore TUI mode
-            let _ = terminal::enable_raw_mode();
-            let _ = crossterm::execute!(
-                std::io::stdout(),
-                terminal::EnterAlternateScreen,
-                terminal::Clear(terminal::ClearType::All)
-            );
-
-            self.needs_redraw = true;
+        // Build and run the editor command. `+N` opens at a line for hx/vim/
+        // nano/emacs; harmless to omit when there's no hunk line.
+        let mut cmd = std::process::Command::new(&command);
+        cmd.args(&editor_args);
+        if let Some(n) = line {
+            cmd.arg(format!("+{n}"));
         }
+        cmd.arg(&file_path);
+        let _ = cmd.status();
+
+        // Restore TUI mode
+        let _ = terminal::enable_raw_mode();
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            terminal::EnterAlternateScreen,
+            terminal::Clear(terminal::ClearType::All)
+        );
+
+        // Re-derive list + diff so edits are reflected immediately.
+        self.refresh();
     }
 }
 
