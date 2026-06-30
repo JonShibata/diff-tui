@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Constraint, Layout, Position},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     DefaultTerminal, Frame,
 };
 
@@ -33,6 +33,7 @@ pub struct App {
     pub diff_content: Vec<u8>,
     pub diff_lines: Vec<Line<'static>>,
     pub diff_scroll: u16,
+    pub wrap: bool,
     pub selected_file: Option<String>,
     pub config: Config,
     pub needs_redraw: bool,
@@ -64,6 +65,7 @@ impl App {
             diff_content: Vec::new(),
             diff_lines: Vec::new(),
             diff_scroll: 0,
+            wrap: false,
             selected_file: None,
             config,
             needs_redraw: false,
@@ -186,15 +188,20 @@ impl App {
             .cloned()
             .collect();
 
-        let diff = Paragraph::new(visible_lines)
-            .block(Block::default().title(title).borders(Borders::ALL));
+        let mut diff =
+            Paragraph::new(visible_lines).block(Block::default().title(title).borders(Borders::ALL));
+        if self.wrap {
+            // `trim: false` keeps leading whitespace so wrapped code stays aligned.
+            diff = diff.wrap(Wrap { trim: false });
+        }
 
         frame.render_widget(diff, chunks[0]);
 
         let total_lines = self.diff_lines.len();
         let current_line = self.diff_scroll as usize + 1;
         let help = Paragraph::new(format!(
-            " j/k: scroll | e: edit | Esc: back | q: quit | Line {}/{} ",
+            " j/k: scroll | e: edit | w: wrap ({}) | Esc: back | q: quit | Line {}/{} ",
+            if self.wrap { "on" } else { "off" },
             current_line.min(total_lines),
             total_lines
         ))
@@ -289,6 +296,7 @@ impl App {
             KeyCode::Char('e') => {
                 self.open_in_editor();
             }
+            KeyCode::Char('w') => self.wrap = !self.wrap,
             _ => {}
         }
     }
