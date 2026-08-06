@@ -134,6 +134,19 @@ fn try_tool(
     Ok(output.stdout)
 }
 
+/// jj parses path arguments after `--` as *fileset expressions*, not literal
+/// paths: characters like `$`, spaces, and glob metacharacters have syntactic
+/// meaning, so a path such as `.../$id/index.tsx` is a fileset parse error and
+/// jj prints nothing to stdout — the file shows in the list (from `--summary`,
+/// which takes no path) but the diff view comes up empty. Wrap the literal path
+/// in a double-quoted fileset string so every character is taken verbatim,
+/// escaping `\` and `"` for the string literal itself. A bare quoted string is a
+/// cwd-relative prefix pattern, matching the semantics the bare path already had.
+fn fileset_literal(file_path: &str) -> String {
+    let escaped = file_path.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
 /// Uncolored git-format diff for one file (jj disables color when piped).
 fn get_jj_diff_output(file_path: &str, selection: &[String]) -> Result<Vec<u8>, ()> {
     let output = Command::new("jj")
@@ -141,7 +154,7 @@ fn get_jj_diff_output(file_path: &str, selection: &[String]) -> Result<Vec<u8>, 
         .args(selection)
         .arg("--git")
         .arg("--")
-        .arg(file_path)
+        .arg(fileset_literal(file_path))
         .output()
         .map_err(|_| ())?;
 
@@ -155,7 +168,7 @@ fn try_jj_color_diff(file_path: &str, selection: &[String]) -> Result<Vec<u8>, (
         .args(selection)
         .arg("--git")
         .arg("--")
-        .arg(file_path)
+        .arg(fileset_literal(file_path))
         .output()
         .map_err(|_| ())?;
 
@@ -164,7 +177,22 @@ fn try_jj_color_diff(file_path: &str, selection: &[String]) -> Result<Vec<u8>, (
 
 #[cfg(test)]
 mod tests {
-    use super::first_change_lines;
+    use super::{first_change_lines, fileset_literal};
+
+    #[test]
+    fn fileset_literal_quotes_dollar_paths() {
+        // `$` is a fileset metacharacter; quoting makes it literal.
+        assert_eq!(
+            fileset_literal("web/routes/$id/index.tsx"),
+            "\"web/routes/$id/index.tsx\""
+        );
+    }
+
+    #[test]
+    fn fileset_literal_escapes_backslash_and_quote() {
+        // Escape for the string literal itself so exotic names still round-trip.
+        assert_eq!(fileset_literal(r#"a\b"c"#), r#""a\\b\"c""#);
+    }
 
     #[test]
     fn skips_leading_context_to_first_addition() {
