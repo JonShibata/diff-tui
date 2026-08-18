@@ -332,12 +332,19 @@ impl App {
     }
 
     /// From the diff view, move to the next/previous file in the list and load
-    /// its diff in place (staying in the diff view).
+    /// its diff in place (staying in the diff view). At a boundary (last file
+    /// with `n`, first file with `N`) the selection can't advance, so return to
+    /// the file list with that file still highlighted instead of reloading it.
     fn show_adjacent_file(&mut self, forward: bool) {
+        let current = self.list_state.selected();
         if forward {
             self.select_next();
         } else {
             self.select_previous();
+        }
+        if self.list_state.selected() == current {
+            self.screen = Screen::FileList;
+            return;
         }
         self.load_diff_for_selected();
     }
