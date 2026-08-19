@@ -98,9 +98,13 @@ fn try_tool(
     // Build command with arguments
     let mut cmd = Command::new(tool_name);
 
-    // Add width argument for delta
+    // Add width argument for delta. `--max-line-length 0` disables delta's
+    // default 512-char truncation so the full line reaches the TUI, which then
+    // soft-wraps it; without it, long lines are cut off with a `→` marker before
+    // we ever see them. Delta can be slow on very long (e.g. minified) lines
+    // with truncation off, an acceptable trade for not losing content.
     if tool_name == "delta" {
-        cmd.args(["--width", &width.to_string()]);
+        cmd.args(["--width", &width.to_string(), "--max-line-length", "0"]);
     }
 
     // Add extra arguments from config

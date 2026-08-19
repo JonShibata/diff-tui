@@ -71,7 +71,11 @@ impl App {
             diff_content: Vec::new(),
             diff_lines: Vec::new(),
             diff_scroll: 0,
-            wrap: false,
+            // Wrap on by default so long lines are shown in full; `w` toggles it
+            // off for one-row-per-line. Delta already preserves the whole line
+            // (see `--max-line-length 0`), so nothing is truncated either way
+            // except by the screen edge when wrap is off.
+            wrap: true,
             selected_file: None,
             config,
             needs_redraw: false,
