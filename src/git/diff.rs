@@ -26,25 +26,30 @@ pub fn get_diff(file_path: &str, width: u16, config: &DiffConfig, selection: &[S
     }
 }
 
-/// New-file line of the first *changed* line in each hunk, in order. The `@@ -a,b
-/// +c,d @@` header's `c` points at the hunk's first line, which is usually leading
-/// context; here we walk the hunk body past that context to the first added (`+`)
-/// or removed (`-`) line so the editor jumps to the actual change, not the context.
-pub fn hunk_first_change_lines(file_path: &str, selection: &[String]) -> Vec<u32> {
+/// For each hunk, the new-file line number that each body line (context,
+/// addition, or deletion, in raw order) maps to. Lets the editor jump to
+/// whatever line is at the top of the diff view, not just the hunk's first
+/// changed line: context and addition lines get their own new-file line
+/// number, and a deletion gets the line number of whatever now occupies its
+/// position (the following context/addition line, or one past the hunk's end).
+pub fn hunk_line_targets(file_path: &str, selection: &[String]) -> Vec<Vec<u32>> {
     let raw = get_jj_diff_output(file_path, selection).unwrap_or_default();
-    first_change_lines(&String::from_utf8_lossy(&raw))
+    parse_hunk_line_targets(&String::from_utf8_lossy(&raw))
 }
 
-/// Parse the first-changed new-file line of each hunk from raw git-format diff text.
-/// Split out from the shell-out above so it can be unit-tested directly.
-fn first_change_lines(text: &str) -> Vec<u32> {
-    let mut result = Vec::new();
+/// Parse per-hunk line targets from raw git-format diff text. Split out from
+/// the shell-out above so it can be unit-tested directly.
+fn parse_hunk_line_targets(text: &str) -> Vec<Vec<u32>> {
+    let mut hunks = Vec::new();
+    let mut current = Vec::new();
     let mut new_line: u32 = 0;
     let mut in_hunk = false;
-    let mut found = false;
 
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("@@") {
+            if in_hunk {
+                hunks.push(std::mem::take(&mut current));
+            }
             // "@@ -a,b +c,d @@ ..." -> the digits right after '+' are the new start.
             if let Some(c) = rest.split('+').nth(1).and_then(|plus| {
                 let digits: String = plus.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -52,28 +57,35 @@ fn first_change_lines(text: &str) -> Vec<u32> {
             }) {
                 new_line = c;
                 in_hunk = true;
-                found = false;
+            } else {
+                in_hunk = false;
             }
             continue;
         }
-        if !in_hunk || found {
+        if !in_hunk {
             continue;
         }
         match line.chars().next() {
-            // First change in the hunk: an addition sits at `new_line`; a deletion
-            // jumps to the new-file line that now occupies that position.
-            Some('+') | Some('-') => {
-                result.push(new_line);
-                found = true;
+            // Present in the new file, so this line owns the current counter
+            // value and advances it.
+            Some('+') | Some(' ') => {
+                current.push(new_line);
+                new_line += 1;
             }
-            // Context line: present in the new file, so advance the counter.
-            Some(' ') => new_line += 1,
-            // "\ No newline at end of file" — not a real line; ignore.
+            // Removed: not in the new file, so it takes the position that
+            // whatever follows will occupy, without advancing the counter.
+            Some('-') => current.push(new_line),
+            // "\ No newline at end of file" still renders as its own row, so
+            // give it a target too, keeping row alignment with the rendered diff.
+            Some('\\') => current.push(new_line),
             _ => {}
         }
     }
+    if in_hunk {
+        hunks.push(current);
+    }
 
-    result
+    hunks
 }
 
 fn try_tool(
@@ -181,7 +193,7 @@ fn try_jj_color_diff(file_path: &str, selection: &[String]) -> Result<Vec<u8>, (
 
 #[cfg(test)]
 mod tests {
-    use super::{first_change_lines, fileset_literal};
+    use super::{fileset_literal, parse_hunk_line_targets};
 
     #[test]
     fn fileset_literal_quotes_dollar_paths() {
@@ -199,8 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_leading_context_to_first_addition() {
-        // Header says new start is line 10, but the change is 3 context lines in.
+    fn context_and_addition_lines_get_consecutive_targets() {
         let diff = "\
 @@ -10,6 +10,7 @@ fn foo() {
  ctx a
@@ -209,13 +220,13 @@ mod tests {
 +added line
  ctx d
 ";
-        assert_eq!(first_change_lines(diff), vec![13]);
+        assert_eq!(parse_hunk_line_targets(diff), vec![vec![10, 11, 12, 13, 14]]);
     }
 
     #[test]
-    fn leading_context_then_deletion() {
-        // Two context lines, then a deletion: jumps to the new-file line now at
-        // that position (12 = 10 + 2 context lines).
+    fn deletion_takes_the_position_of_whatever_follows() {
+        // The deletion doesn't advance the counter, so it shares the next
+        // context line's new-file number (12 = 10 + 2 context lines).
         let diff = "\
 @@ -10,4 +10,3 @@
  ctx a
@@ -223,7 +234,7 @@ mod tests {
 -removed line
  ctx c
 ";
-        assert_eq!(first_change_lines(diff), vec![12]);
+        assert_eq!(parse_hunk_line_targets(diff), vec![vec![10, 11, 12, 12]]);
     }
 
     #[test]
@@ -234,11 +245,11 @@ mod tests {
  ctx a
  ctx b
 ";
-        assert_eq!(first_change_lines(diff), vec![1]);
+        assert_eq!(parse_hunk_line_targets(diff), vec![vec![1, 2, 3]]);
     }
 
     #[test]
-    fn one_entry_per_hunk_in_order() {
+    fn one_vector_per_hunk_in_order() {
         let diff = "\
 @@ -10,5 +10,6 @@
  ctx a
@@ -250,11 +261,15 @@ mod tests {
 +add in hunk two
  ctx e
 ";
-        assert_eq!(first_change_lines(diff), vec![12, 42]);
+        assert_eq!(
+            parse_hunk_line_targets(diff),
+            vec![vec![10, 11, 12, 13], vec![41, 42, 43]]
+        );
     }
 
     #[test]
-    fn ignores_no_newline_marker() {
+    fn no_newline_marker_still_gets_a_target() {
+        // Keeps row alignment with the rendered diff, which shows this as its own row.
         let diff = "\
 @@ -1,2 +1,2 @@
  ctx a
@@ -263,12 +278,11 @@ mod tests {
 +new last
 \\ No newline at end of file
 ";
-        // First change is the deletion at new-file line 2 (after one context line).
-        assert_eq!(first_change_lines(diff), vec![2]);
+        assert_eq!(parse_hunk_line_targets(diff), vec![vec![1, 2, 2, 2, 3]]);
     }
 
     #[test]
     fn empty_input_yields_no_hunks() {
-        assert_eq!(first_change_lines(""), Vec::<u32>::new());
+        assert_eq!(parse_hunk_line_targets(""), Vec::<Vec<u32>>::new());
     }
 }

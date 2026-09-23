@@ -6,7 +6,10 @@ use ratatui::{
     layout::{Constraint, Layout, Position},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Wrap,
+    },
     DefaultTerminal, Frame,
 };
 
@@ -39,8 +42,9 @@ pub struct App {
     pub needs_redraw: bool,
     repository: Repository,
     selection: Vec<String>,
-    /// (rendered row index of a hunk start, hunk's new-file line) for the open diff.
-    hunk_markers: Vec<(usize, u32)>,
+    /// New-file line number for each rendered row of the open diff, `None` for
+    /// rows that aren't a hunk body line (file/hunk headers, separator rules).
+    line_numbers: Vec<Option<u32>>,
     /// Transient status line (e.g. "Copied: …"), cleared on the next keypress.
     status_message: Option<String>,
 }
@@ -81,7 +85,7 @@ impl App {
             needs_redraw: false,
             repository,
             selection,
-            hunk_markers: Vec::new(),
+            line_numbers: Vec::new(),
             status_message: None,
         })
     }
@@ -216,15 +220,33 @@ impl App {
         frame.render_widget(diff, chunks[0]);
 
         let total_lines = self.diff_lines.len();
+        if total_lines > visible_height {
+            let mut scrollbar_state = ScrollbarState::new(total_lines)
+                .position(self.diff_scroll as usize)
+                .viewport_content_length(visible_height);
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None);
+            frame.render_stateful_widget(
+                scrollbar,
+                chunks[0].inner(ratatui::layout::Margin {
+                    horizontal: 0,
+                    vertical: 1,
+                }),
+                &mut scrollbar_state,
+            );
+        }
         let current_line = self.diff_scroll as usize + 1;
+        let position = scroll_position_label(self.diff_scroll as usize, visible_height, total_lines);
         let (help_str, help_color) = match &self.status_message {
             Some(msg) => (msg.clone(), Color::Green),
             None => (
                 format!(
-                    " j/k: scroll | n/N: next/prev file | e: edit | c: copy path | w: wrap ({}) | r: reload | h/Esc: back | q: quit | Line {}/{} ",
+                    " e: edit | c: copy path | w: wrap ({}) | r: reload | Line {}/{} ({}) ",
                     if self.wrap { "on" } else { "off" },
                     current_line.min(total_lines),
-                    total_lines
+                    total_lines,
+                    position
                 ),
                 Color::DarkGray,
             ),
@@ -456,19 +478,27 @@ impl App {
                         }
                     };
 
-                    // Pair each rendered hunk-separator rule row with the new-file
-                    // line of the hunk's first actual change (from the raw diff), in
-                    // order. Used by `e` to open the editor at the change in the hunk
-                    // currently in view.
-                    let starts = crate::git::hunk_first_change_lines(&file.path, &self.selection);
-                    self.hunk_markers = self
+                    // Map each rendered hunk-body row to its new-file line number, so
+                    // `e` can open the editor at whatever line is at the top of the
+                    // current scroll position, not just the hunk's first change. Each
+                    // hunk's body starts right after its rendered separator rule.
+                    let hunk_targets = crate::git::hunk_line_targets(&file.path, &self.selection);
+                    let mut targets = hunk_targets.into_iter();
+                    let mut current_hunk: Option<std::vec::IntoIter<u32>> = None;
+                    self.line_numbers = self
                         .diff_lines
                         .iter()
-                        .enumerate()
-                        .filter(|(_, line)| is_rule_row(line))
-                        .map(|(i, _)| i)
-                        .zip(starts)
-                        .map(|(row, line_no)| (row.saturating_sub(1), line_no))
+                        .map(|line| {
+                            if is_rule_row(line) {
+                                current_hunk = targets.next().map(|v| v.into_iter());
+                                return None;
+                            }
+                            let target = current_hunk.as_mut().and_then(|iter| iter.next());
+                            if target.is_none() {
+                                current_hunk = None;
+                            }
+                            target
+                        })
                         .collect();
 
                     self.diff_scroll = 0;
@@ -531,22 +561,20 @@ impl App {
         }
     }
 
-    /// File line to open the editor at: the first changed line of the hunk at the
-    /// top of the diff view. None when not viewing a diff or no hunks were detected.
+    /// File line to open the editor at: the new-file line currently at the top of
+    /// the diff view's scroll position, so the editor lands on what's on screen
+    /// even deep inside a large hunk. When that row is a header/rule decoration
+    /// row rather than a body line, falls forward to the next body row, then
+    /// backward. None when not viewing a diff or no hunks were detected.
     fn current_hunk_line(&self) -> Option<u32> {
-        if self.screen != Screen::DiffView || self.hunk_markers.is_empty() {
+        if self.screen != Screen::DiffView || self.line_numbers.is_empty() {
             return None;
         }
-        let scroll = self.diff_scroll as usize;
-        let mut line = self.hunk_markers[0].1; // default to the first hunk
-        for &(row, line_no) in &self.hunk_markers {
-            if row <= scroll {
-                line = line_no;
-            } else {
-                break;
-            }
-        }
-        Some(line)
+        let scroll = (self.diff_scroll as usize).min(self.line_numbers.len() - 1);
+        self.line_numbers[scroll..]
+            .iter()
+            .find_map(|&n| n)
+            .or_else(|| self.line_numbers[..scroll].iter().rev().find_map(|&n| n))
     }
 
     fn open_in_editor(&mut self) {
@@ -582,6 +610,22 @@ impl App {
         // Re-derive list + diff so edits are reflected immediately.
         self.refresh();
     }
+}
+
+/// Label for how far scrolled into the diff the view is, matching `less`'s
+/// Top/Bot/All/percentage convention.
+fn scroll_position_label(scroll: usize, visible_height: usize, total_lines: usize) -> String {
+    if total_lines <= visible_height {
+        return "All".to_string();
+    }
+    if scroll == 0 {
+        return "Top".to_string();
+    }
+    let max_scroll = total_lines - visible_height;
+    if scroll >= max_scroll {
+        return "Bot".to_string();
+    }
+    format!("{}%", scroll * 100 / max_scroll)
 }
 
 /// True if a rendered row is a delta hunk-separator rule (a run of `─`),

@@ -1,5 +1,5 @@
 mod diff;
 mod repository;
 
-pub use diff::{get_diff, hunk_first_change_lines};
+pub use diff::{get_diff, hunk_line_targets};
 pub use repository::{ChangedFile, FileStatus, Repository};
