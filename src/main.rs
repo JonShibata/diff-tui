@@ -25,7 +25,11 @@ KEYBINDINGS:
         l/Enter   View diff of selected file
         e         Open file in editor
         c         Copy file path to clipboard
-        /         Start search mode
+        /         Regex search across every file's diff
+                  (case-insensitive unless the pattern has capitals)
+        n/N       Next / previous match (while a search is active)
+        f         Filter files by name
+        Esc       Clear the active search
         r         Reload
         q         Quit
 
@@ -36,11 +40,15 @@ KEYBINDINGS:
         u/PgUp    Scroll up 20 lines
         g/Home    Go to top
         G/End     Go to bottom
-        n/N       Next / previous file
+        /         Regex search across every file's diff
+                  (case-insensitive unless the pattern has capitals)
+        n/N       Next / previous match, crossing files; next / previous file
+                  when no search is active
         e         Open file in editor
         c         Copy file path to clipboard
         r         Reload
-        h/Esc     Return to file list
+        Esc       Clear the active search, else return to file list
+        h         Return to file list
         q         Quit
 ")]
 struct Cli {

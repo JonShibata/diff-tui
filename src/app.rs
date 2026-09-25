@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use ansi_to_tui::IntoText as _;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -12,6 +15,7 @@ use ratatui::{
     },
     DefaultTerminal, Frame,
 };
+use regex::{Regex, RegexBuilder};
 
 use crate::config::Config;
 use crate::fuzzy::FuzzyMatcher;
@@ -21,6 +25,15 @@ use crate::git::{ChangedFile, FileStatus, Repository};
 pub enum Screen {
     FileList,
     DiffView,
+}
+
+/// A regex search over the rendered diffs of every file in the list.
+struct ContentSearch {
+    regex: Regex,
+    /// (list position, rendered row) of every matching row, in list then row order.
+    matches: Vec<(usize, usize)>,
+    /// Index into `matches` of the match last jumped to.
+    current: Option<usize>,
 }
 
 pub struct App {
@@ -33,7 +46,6 @@ pub struct App {
     pub search_mode: bool,
     pub search_query: String,
     pub fuzzy_matcher: FuzzyMatcher,
-    pub diff_content: Vec<u8>,
     pub diff_lines: Vec<Line<'static>>,
     pub diff_scroll: u16,
     pub wrap: bool,
@@ -47,6 +59,13 @@ pub struct App {
     line_numbers: Vec<Option<u32>>,
     /// Transient status line (e.g. "Copied: …"), cleared on the next keypress.
     status_message: Option<String>,
+    /// Text typed into the `/` prompt; `Some` while the prompt is open.
+    search_prompt: Option<String>,
+    /// Regex submitted from the prompt, run after the next draw so "Searching…" shows first.
+    pending_search: Option<Regex>,
+    content_search: Option<ContentSearch>,
+    /// Rendered diffs by path, filled by a search so jumps show exactly what was searched.
+    diff_cache: HashMap<String, Vec<Line<'static>>>,
 }
 
 impl App {
@@ -72,7 +91,6 @@ impl App {
             search_mode: false,
             search_query: String::new(),
             fuzzy_matcher: FuzzyMatcher::new(),
-            diff_content: Vec::new(),
             diff_lines: Vec::new(),
             diff_scroll: 0,
             // Wrap on by default so long lines are shown in full; `w` toggles it
@@ -87,6 +105,10 @@ impl App {
             selection,
             line_numbers: Vec::new(),
             status_message: None,
+            search_prompt: None,
+            pending_search: None,
+            content_search: None,
+            diff_cache: HashMap::new(),
         })
     }
 
@@ -97,6 +119,10 @@ impl App {
                 self.needs_redraw = false;
             }
             terminal.draw(|frame| self.draw(frame))?;
+            if let Some(regex) = self.pending_search.take() {
+                self.start_search(regex);
+                continue;
+            }
             self.handle_events()?;
         }
         Ok(())
@@ -126,7 +152,7 @@ impl App {
 
         let (list_area, help_area) = if self.search_mode {
             // Draw search input
-            let search_block = Block::default().title(" Search ").borders(Borders::ALL);
+            let search_block = Block::default().title(" Filter ").borders(Borders::ALL);
             let search_input = Paragraph::new(self.search_query.as_str()).block(search_block);
             frame.render_widget(search_input, chunks[0]);
 
@@ -141,12 +167,22 @@ impl App {
             (chunks[0], chunks[1])
         };
 
+        let mut match_counts = vec![0usize; self.filtered_indices.len()];
+        if let Some(search) = &self.content_search {
+            for &(pos, _) in &search.matches {
+                if let Some(count) = match_counts.get_mut(pos) {
+                    *count += 1;
+                }
+            }
+        }
+
         // Build list items from filtered indices
         let items: Vec<ListItem> = self
             .filtered_indices
             .iter()
             .filter_map(|&idx| self.files.get(idx))
-            .map(|file| {
+            .zip(&match_counts)
+            .map(|(file, &count)| {
                 let status_char = match file.status {
                     FileStatus::Modified => ("M", Color::Yellow),
                     FileStatus::Added => ("A", Color::Green),
@@ -154,14 +190,20 @@ impl App {
                     FileStatus::Renamed => ("R", Color::Cyan),
                     FileStatus::Untracked => ("?", Color::Gray),
                 };
-                let line = Line::from(vec![
+                let mut spans = vec![
                     Span::styled(
                         format!("{} ", status_char.0),
                         Style::default().fg(status_char.1),
                     ),
                     Span::raw(&file.path),
-                ]);
-                ListItem::new(line)
+                ];
+                if count > 0 {
+                    spans.push(Span::styled(
+                        format!(" ({count})"),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
             })
             .collect();
 
@@ -182,16 +224,35 @@ impl App {
         frame.render_stateful_widget(list, list_area, &mut self.list_state);
 
         let help_text = if self.search_mode {
-            " Type to search | Enter: select | Esc: cancel "
+            " Type to filter | Enter: select | Esc: cancel ".to_string()
+        } else if let Some(search) = &self.content_search {
+            format!(
+                " n/N: next/prev match ({}) | Esc: clear search | l/Enter: view diff | /: search | f: filter | q: quit",
+                search_summary(search)
+            )
         } else {
-            " j/k: move | l/Enter: view diff | e: edit | c: copy path | /: search | r: reload | q: quit"
+            " j/k: move | l/Enter: view diff | e: edit | c: copy path | /: search | f: filter | r: reload | q: quit"
+                .to_string()
         };
+        self.draw_bottom_line(frame, help_area, help_text);
+    }
+
+    /// Bottom line: the open `/` prompt, else a transient status message, else `help_text`.
+    fn draw_bottom_line(&self, frame: &mut Frame, area: ratatui::layout::Rect, help_text: String) {
+        if let Some(input) = &self.search_prompt {
+            frame.render_widget(Paragraph::new(format!("/{input}")), area);
+            frame.set_cursor_position(Position::new(
+                area.x + 1 + input.chars().count() as u16,
+                area.y,
+            ));
+            return;
+        }
         let (help_str, help_color) = match &self.status_message {
             Some(msg) => (msg.clone(), Color::Green),
-            None => (help_text.to_string(), Color::DarkGray),
+            None => (help_text, Color::DarkGray),
         };
         let help = Paragraph::new(help_str).style(Style::default().fg(help_color));
-        frame.render_widget(help, help_area);
+        frame.render_widget(help, area);
     }
 
     fn draw_diff_view(&mut self, frame: &mut Frame) {
@@ -202,12 +263,28 @@ impl App {
         let title = format!(" {} ", self.selected_file.as_deref().unwrap_or("Diff"));
 
         let visible_height = chunks[0].height.saturating_sub(2) as usize;
+        let list_pos = self.list_state.selected();
+        let current_match = self
+            .content_search
+            .as_ref()
+            .and_then(|s| s.current.and_then(|i| s.matches.get(i)).copied());
         let visible_lines: Vec<Line> = self
             .diff_lines
             .iter()
+            .enumerate()
             .skip(self.diff_scroll as usize)
             .take(visible_height)
-            .cloned()
+            .map(|(row, line)| match &self.content_search {
+                Some(search) => {
+                    let style = if list_pos.map(|pos| (pos, row)) == current_match {
+                        current_match_style()
+                    } else {
+                        match_style()
+                    };
+                    highlight_matches(line, &search.regex, style)
+                }
+                None => line.clone(),
+            })
             .collect();
 
         let mut diff =
@@ -238,21 +315,18 @@ impl App {
         }
         let current_line = self.diff_scroll as usize + 1;
         let position = scroll_position_label(self.diff_scroll as usize, visible_height, total_lines);
-        let (help_str, help_color) = match &self.status_message {
-            Some(msg) => (msg.clone(), Color::Green),
-            None => (
-                format!(
-                    " e: edit | c: copy path | w: wrap ({}) | r: reload | Line {}/{} ({}) ",
-                    if self.wrap { "on" } else { "off" },
-                    current_line.min(total_lines),
-                    total_lines,
-                    position
-                ),
-                Color::DarkGray,
-            ),
+        let nav_help = match &self.content_search {
+            Some(search) => format!("n/N: match ({}) | Esc: clear search", search_summary(search)),
+            None => "/: search".to_string(),
         };
-        let help = Paragraph::new(help_str).style(Style::default().fg(help_color));
-        frame.render_widget(help, chunks[1]);
+        let help_text = format!(
+            " {nav_help} | e: edit | c: copy path | w: wrap ({}) | r: reload | Line {}/{} ({}) ",
+            if self.wrap { "on" } else { "off" },
+            current_line.min(total_lines),
+            total_lines,
+            position
+        );
+        self.draw_bottom_line(frame, chunks[1], help_text);
     }
 
     fn handle_events(&mut self) -> Result<()> {
@@ -263,6 +337,10 @@ impl App {
 
             // Clear any transient status (e.g. "Copied: …") on the next keypress.
             self.status_message = None;
+            if self.search_prompt.is_some() {
+                self.handle_search_prompt_keys(key.code);
+                return Ok(());
+            }
             match self.screen {
                 Screen::FileList => self.handle_file_list_keys(key.code),
                 Screen::DiffView => self.handle_diff_view_keys(key.code),
@@ -300,9 +378,13 @@ impl App {
         } else {
             match code {
                 KeyCode::Char('q') => self.running = false,
+                KeyCode::Char('n') if self.content_search.is_some() => self.jump_to_match(true),
+                KeyCode::Char('N') if self.content_search.is_some() => self.jump_to_match(false),
+                KeyCode::Esc => self.clear_search(),
                 KeyCode::Char('j') | KeyCode::Char('n') | KeyCode::Down => self.select_next(),
                 KeyCode::Char('k') | KeyCode::Char('N') | KeyCode::Up => self.select_previous(),
-                KeyCode::Char('/') => {
+                KeyCode::Char('/') => self.search_prompt = Some(String::new()),
+                KeyCode::Char('f') => {
                     self.search_mode = true;
                 }
                 KeyCode::Char('e') => self.open_selected_in_editor(),
@@ -319,6 +401,7 @@ impl App {
             KeyCode::Char('q') => {
                 self.running = false;
             }
+            KeyCode::Esc if self.content_search.is_some() => self.clear_search(),
             KeyCode::Esc | KeyCode::Char('h') => {
                 self.screen = Screen::FileList;
                 self.diff_scroll = 0;
@@ -351,10 +434,168 @@ impl App {
             }
             KeyCode::Char('c') => self.copy_current_path(),
             KeyCode::Char('w') => self.wrap = !self.wrap,
+            KeyCode::Char('/') => self.search_prompt = Some(String::new()),
+            KeyCode::Char('n') if self.content_search.is_some() => self.jump_to_match(true),
+            KeyCode::Char('N') if self.content_search.is_some() => self.jump_to_match(false),
             KeyCode::Char('n') => self.show_adjacent_file(true),
             KeyCode::Char('N') => self.show_adjacent_file(false),
             _ => {}
         }
+    }
+
+    fn handle_search_prompt_keys(&mut self, code: KeyCode) {
+        let Some(input) = self.search_prompt.as_mut() else {
+            return;
+        };
+        match code {
+            KeyCode::Esc => self.search_prompt = None,
+            KeyCode::Backspace => {
+                input.pop();
+            }
+            KeyCode::Char(c) => input.push(c),
+            KeyCode::Enter => {
+                let input = self.search_prompt.take().unwrap_or_default();
+                if input.is_empty() {
+                    return;
+                }
+                match smart_case_regex(&input) {
+                    Ok(regex) => {
+                        self.status_message = Some(format!("Searching all files for /{input}/…"));
+                        self.pending_search = Some(regex);
+                    }
+                    Err(e) => {
+                        // regex errors span several lines; the last one names the problem.
+                        let msg = e.to_string();
+                        let reason = msg.lines().last().unwrap_or_default().to_string();
+                        self.status_message = Some(format!("Invalid regex: {reason}"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Run a freshly submitted search and jump to the first match at or after the view.
+    fn start_search(&mut self, regex: Regex) {
+        self.status_message = None;
+        let search = self.search_files(regex);
+        if search.matches.is_empty() {
+            self.status_message = Some(format!("Pattern not found: {}", search.regex));
+            self.clear_search();
+            return;
+        }
+        self.content_search = Some(search);
+        let pos = self.list_state.selected().unwrap_or(0);
+        let row = match self.screen {
+            Screen::DiffView => (self.diff_scroll as usize).checked_sub(1),
+            Screen::FileList => None,
+        };
+        self.jump_from((pos, row), true);
+    }
+
+    /// Render every listed file's diff (in parallel, reusing the cache) and collect regex matches.
+    fn search_files(&mut self, regex: Regex) -> ContentSearch {
+        self.render_uncached_diffs();
+        let matches = self
+            .filtered_indices
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, &idx)| Some((pos, self.diff_cache.get(&self.files.get(idx)?.path)?)))
+            .flat_map(|(pos, lines)| {
+                lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, line)| regex.is_match(&line_text(line)))
+                    .map(move |(row, _)| (pos, row))
+            })
+            .collect();
+        ContentSearch {
+            regex,
+            matches,
+            current: None,
+        }
+    }
+
+    fn render_uncached_diffs(&mut self) {
+        let paths: Vec<&str> = self
+            .filtered_indices
+            .iter()
+            .filter_map(|&idx| self.files.get(idx))
+            .map(|f| f.path.as_str())
+            .filter(|path| !self.diff_cache.contains_key(*path))
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        let width = diff_width();
+        let config = &self.config.diff;
+        // The file list already snapshotted; skipping the snapshot lets jj run concurrently.
+        let mut selection = self.selection.clone();
+        selection.push("--ignore-working-copy".to_string());
+        let next = AtomicUsize::new(0);
+        let threads = std::thread::available_parallelism()
+            .map_or(4, |n| n.get())
+            .min(paths.len());
+        let rendered: Vec<(String, Vec<Line<'static>>)> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut out = Vec::new();
+                        while let Some(path) = paths.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            out.push((path.to_string(), render_diff(path, width, config, &selection)));
+                        }
+                        out
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|w| w.join().unwrap_or_default())
+                .collect()
+        });
+        self.diff_cache.extend(rendered);
+    }
+
+    /// Jump to the next (or previous) match after the current view position, wrapping around.
+    fn jump_to_match(&mut self, forward: bool) {
+        let pos = self.list_state.selected().unwrap_or(0);
+        let row = match self.screen {
+            Screen::DiffView => Some(self.diff_scroll as usize),
+            Screen::FileList => None,
+        };
+        self.jump_from((pos, row), forward);
+    }
+
+    fn jump_from(&mut self, cursor: (usize, Option<usize>), forward: bool) {
+        let Some(search) = self.content_search.as_mut() else {
+            return;
+        };
+        let Some((idx, wrapped)) = find_match(&search.matches, cursor, forward) else {
+            self.status_message = Some(format!("Pattern not found: {}", search.regex));
+            return;
+        };
+        search.current = Some(idx);
+        let (pos, row) = search.matches[idx];
+        if wrapped {
+            self.status_message = Some(if forward {
+                "Search hit BOTTOM, continuing at TOP".to_string()
+            } else {
+                "Search hit TOP, continuing at BOTTOM".to_string()
+            });
+        }
+        if self.screen != Screen::DiffView || self.list_state.selected() != Some(pos) {
+            self.list_state.select(Some(pos));
+            if !self.load_diff_for_selected() {
+                return;
+            }
+            self.screen = Screen::DiffView;
+        }
+        self.diff_scroll = row as u16;
+    }
+
+    fn clear_search(&mut self) {
+        self.content_search = None;
+        self.diff_cache.clear();
     }
 
     /// From the diff view, move to the next/previous file in the list and load
@@ -429,6 +670,10 @@ impl App {
         } else {
             self.list_state.select(None);
         }
+        // Matches are keyed by list position, so re-run the search over the new list.
+        if let Some(search) = self.content_search.take() {
+            self.content_search = Some(self.search_files(search.regex));
+        }
     }
 
     fn open_diff(&mut self) {
@@ -446,36 +691,14 @@ impl App {
             if let Some(&file_idx) = self.filtered_indices.get(list_idx) {
                 if let Some(file) = self.files.get(file_idx) {
                     self.selected_file = Some(file.path.clone());
-                    // Get terminal width (subtract 2 for border)
-                    let width = terminal::size()
-                        .map(|(w, _)| w.saturating_sub(2))
-                        .unwrap_or(80);
-                    self.diff_content =
-                        crate::git::get_diff(&file.path, width, &self.config.diff, &self.selection);
-
-                    // Parse ANSI escape sequences into styled lines
-                    self.diff_lines = match self.diff_content.as_slice().into_text() {
-                        Ok(text) => text
-                            .lines
-                            .into_iter()
-                            .map(|line| {
-                                Line::from(
-                                    line.spans
-                                        .into_iter()
-                                        .map(|span| {
-                                            Span::styled(span.content.to_string(), span.style)
-                                        })
-                                        .collect::<Vec<_>>(),
-                                )
-                            })
-                            .collect(),
-                        Err(_) => {
-                            // Fallback: plain text without ANSI parsing
-                            String::from_utf8_lossy(&self.diff_content)
-                                .lines()
-                                .map(|s| Line::raw(s.to_string()))
-                                .collect()
-                        }
+                    self.diff_lines = match self.diff_cache.get(&file.path) {
+                        Some(lines) => lines.clone(),
+                        None => render_diff(
+                            &file.path,
+                            diff_width(),
+                            &self.config.diff,
+                            &self.selection,
+                        ),
                     };
 
                     // Map each rendered hunk-body row to its new-file line number, so
@@ -513,6 +736,8 @@ impl App {
     fn refresh(&mut self) {
         let prev_path = self.selected_file.clone();
         let prev_scroll = self.diff_scroll;
+        // Drop renders from before the reload; update_filter re-renders them for an active search.
+        self.diff_cache.clear();
 
         if let Ok(files) = self.repository.get_changed_files() {
             self.file_paths = files.iter().map(|f| f.path.clone()).collect();
@@ -628,10 +853,142 @@ fn scroll_position_label(scroll: usize, visible_height: usize, total_lines: usiz
     format!("{}%", scroll * 100 / max_scroll)
 }
 
+/// Diff tool output width: the terminal width minus the diff block's border.
+fn diff_width() -> u16 {
+    terminal::size()
+        .map(|(w, _)| w.saturating_sub(2))
+        .unwrap_or(80)
+}
+
+/// Run the configured diff tool for one file and parse its ANSI output into styled lines.
+fn render_diff(
+    path: &str,
+    width: u16,
+    config: &crate::config::DiffConfig,
+    selection: &[String],
+) -> Vec<Line<'static>> {
+    let content = crate::git::get_diff(path, width, config, selection);
+    match content.as_slice().into_text() {
+        Ok(text) => text
+            .lines
+            .into_iter()
+            .map(|line| {
+                Line::from(
+                    line.spans
+                        .into_iter()
+                        .map(|span| Span::styled(span.content.to_string(), span.style))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect(),
+        // Fallback: plain text without ANSI parsing
+        Err(_) => String::from_utf8_lossy(&content)
+            .lines()
+            .map(|s| Line::raw(s.to_string()))
+            .collect(),
+    }
+}
+
+/// Compile `pattern` case-insensitively unless it has an uppercase letter outside an escape.
+fn smart_case_regex(pattern: &str) -> Result<Regex, regex::Error> {
+    let mut escaped = false;
+    let has_upper = pattern.chars().any(|c| {
+        let upper = !escaped && c.is_uppercase();
+        escaped = !escaped && c == '\\';
+        upper
+    });
+    RegexBuilder::new(pattern).case_insensitive(!has_upper).build()
+}
+
+fn line_text(line: &Line) -> String {
+    line.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+fn match_style() -> Style {
+    Style::default().fg(Color::Black).bg(Color::Yellow)
+}
+
+fn current_match_style() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(Color::LightRed)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// "i/N in F files" for the help line.
+fn search_summary(search: &ContentSearch) -> String {
+    let mut files: Vec<usize> = search.matches.iter().map(|&(pos, _)| pos).collect();
+    files.dedup();
+    let current = search.current.map_or("-".to_string(), |i| (i + 1).to_string());
+    format!("{current}/{} in {} files", search.matches.len(), files.len())
+}
+
+/// Index of the first match after `cursor` (or last before it when `!forward`), wrapping
+/// around the ends; the bool is true when it wrapped. A `None` row sorts before every row.
+fn find_match(
+    matches: &[(usize, usize)],
+    cursor: (usize, Option<usize>),
+    forward: bool,
+) -> Option<(usize, bool)> {
+    if matches.is_empty() {
+        return None;
+    }
+    let key = |&(pos, row): &(usize, usize)| (pos, Some(row));
+    if forward {
+        Some(match matches.iter().position(|m| key(m) > cursor) {
+            Some(idx) => (idx, false),
+            None => (0, true),
+        })
+    } else {
+        Some(match matches.iter().rposition(|m| key(m) < cursor) {
+            Some(idx) => (idx, false),
+            None => (matches.len() - 1, true),
+        })
+    }
+}
+
+/// Copy of `line` with every non-empty `regex` match patched with `style`, splitting spans.
+fn highlight_matches(line: &Line<'static>, regex: &Regex, style: Style) -> Line<'static> {
+    let text = line_text(line);
+    let ranges: Vec<(usize, usize)> = regex
+        .find_iter(&text)
+        .filter(|m| !m.is_empty())
+        .map(|m| (m.start(), m.end()))
+        .collect();
+    if ranges.is_empty() {
+        return line.clone();
+    }
+    let mut spans = Vec::new();
+    let mut start = 0;
+    for span in &line.spans {
+        let end = start + span.content.len();
+        let mut cut = start;
+        for &(match_start, match_end) in &ranges {
+            let (s, e) = (match_start.max(start), match_end.min(end));
+            if s >= e {
+                continue;
+            }
+            if s > cut {
+                spans.push(Span::styled(text[cut..s].to_string(), span.style));
+            }
+            spans.push(Span::styled(text[s..e].to_string(), span.style.patch(style)));
+            cut = e;
+        }
+        if end > cut {
+            spans.push(Span::styled(text[cut..end].to_string(), span.style));
+        }
+        start = end;
+    }
+    Line {
+        spans,
+        ..line.clone()
+    }
+}
+
 /// True if a rendered row is a delta hunk-separator rule (a run of `─`),
 /// used to locate hunk boundaries in the rendered diff.
 fn is_rule_row(line: &Line) -> bool {
-    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let text = line_text(line);
     text.chars().filter(|&c| c == '─').count() >= 10
         && text.chars().all(|c| c == '─' || c.is_whitespace())
 }
@@ -669,4 +1026,74 @@ fn copy_to_clipboard(text: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_match, highlight_matches, line_text, smart_case_regex};
+    use ratatui::style::{Color, Style};
+    use ratatui::text::{Line, Span};
+    use regex::Regex;
+
+    const MATCHES: [(usize, usize); 3] = [(0, 5), (0, 9), (2, 1)];
+
+    #[test]
+    fn forward_finds_next_match_across_files() {
+        assert_eq!(find_match(&MATCHES, (0, Some(5)), true), Some((1, false)));
+        assert_eq!(find_match(&MATCHES, (0, Some(9)), true), Some((2, false)));
+        // A file-list cursor (no row) includes the file's own first match.
+        assert_eq!(find_match(&MATCHES, (2, None), true), Some((2, false)));
+    }
+
+    #[test]
+    fn forward_wraps_past_the_last_match() {
+        assert_eq!(find_match(&MATCHES, (2, Some(1)), true), Some((0, true)));
+    }
+
+    #[test]
+    fn backward_finds_previous_and_wraps() {
+        assert_eq!(find_match(&MATCHES, (2, Some(1)), false), Some((1, false)));
+        assert_eq!(find_match(&MATCHES, (2, None), false), Some((1, false)));
+        assert_eq!(find_match(&MATCHES, (0, Some(5)), false), Some((2, true)));
+    }
+
+    #[test]
+    fn no_matches_finds_nothing() {
+        assert_eq!(find_match(&[], (0, None), true), None);
+    }
+
+    #[test]
+    fn lowercase_pattern_ignores_case() {
+        assert!(smart_case_regex("foo").unwrap().is_match("FOO"));
+        // Escapes like `\S` are not uppercase literals.
+        assert!(smart_case_regex(r"foo\S").unwrap().is_match("FOOx"));
+    }
+
+    #[test]
+    fn uppercase_pattern_matches_case() {
+        assert!(!smart_case_regex("Foo").unwrap().is_match("foo"));
+        assert!(smart_case_regex("Foo").unwrap().is_match("Foo"));
+        // An escaped backslash does not hide the uppercase letter after it.
+        assert!(!smart_case_regex(r"\\Foo").unwrap().is_match(r"\foo"));
+    }
+
+    #[test]
+    fn highlight_splits_spans_and_keeps_text() {
+        let red = Style::default().fg(Color::Red);
+        let line = Line::from(vec![Span::styled("foo b", red), Span::raw("ar baz")]);
+        let hl = Style::default().bg(Color::Yellow);
+        let out = highlight_matches(&line, &Regex::new("bar").unwrap(), hl);
+        assert_eq!(line_text(&out), "foo bar baz");
+        let styled: Vec<(&str, Style)> =
+            out.spans.iter().map(|s| (s.content.as_ref(), s.style)).collect();
+        assert_eq!(
+            styled,
+            vec![
+                ("foo ", red),
+                ("b", red.patch(hl)),
+                ("ar", hl),
+                (" baz", Style::default()),
+            ]
+        );
+    }
 }

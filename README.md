@@ -5,7 +5,8 @@ A terminal-based Git diff viewer. Provides an intuitive interface for browsing c
 ## Features
 
 - **File Selection**: Browse changed files in your Git repository
-- **Fuzzy Search**: Press `/` to filter files by name
+- **Content Search**: Press `/` to regex-search the diffs of every file, then `n`/`N` to jump between matches. Case-insensitive unless the pattern contains an uppercase letter
+- **Fuzzy Filter**: Press `f` to filter files by name
 - **Colored Diff**: Uses delta or git diff for syntax-highlighted diffs
 - **Status Indicators**: M(modified), A(added), D(deleted), R(renamed), ?(untracked)
 
@@ -83,18 +84,21 @@ diff-tui
 | `k` / `↑` | Move to previous file |
 | `Enter` | View diff of selected file |
 | `e` | Open file in editor |
-| `/` | Start search mode |
+| `/` | Regex search across all diffs |
+| `n` / `N` | Next / previous match (while a search is active) |
+| `f` | Start filter mode |
+| `Esc` | Clear the active search |
 | `q` | Quit |
 
-#### Search Mode
+#### Filter Mode
 
 | Key | Action |
 |-----|--------|
-| Type | Add to search query |
+| Type | Add to filter query |
 | `Backspace` | Delete character |
 | `Enter` | View diff of selected file |
-| `Esc` | Cancel search |
-| `↑` / `↓` | Navigate search results |
+| `Esc` | Cancel filter |
+| `↑` / `↓` | Navigate filtered files |
 
 #### Diff View
 
@@ -106,8 +110,10 @@ diff-tui
 | `u` / `PageUp` | Scroll up 20 lines |
 | `g` / `Home` | Go to top |
 | `G` / `End` | Go to bottom |
+| `/` | Regex search across all diffs |
+| `n` / `N` | Next / previous match, crossing files (next / previous file when no search is active) |
 | `e` | Open file in editor |
-| `Esc` | Return to file selection |
+| `Esc` | Clear the active search, else return to file selection |
 | `q` | Quit |
 
 ## Tech Stack
