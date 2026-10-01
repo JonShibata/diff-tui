@@ -84,6 +84,7 @@ diff-tui
 | `k` / `↑` | Move to previous file |
 | `Enter` | View diff of selected file |
 | `e` | Open file in editor |
+| `s` | Toggle per-file line counts (like `jj diff --stat`) |
 | `/` | Regex search across all diffs |
 | `n` / `N` | Next / previous match (while a search is active) |
 | `f` | Start filter mode |

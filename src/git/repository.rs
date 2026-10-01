@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
 use std::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10,6 +11,14 @@ pub enum FileStatus {
     // jj reports new files as Added, so this is never produced; kept for the UI match.
     #[allow(dead_code)]
     Untracked,
+}
+
+/// Lines added and removed in one file, as `jj diff --stat` counts them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LineStat {
+    pub added: usize,
+    pub removed: usize,
+    pub binary: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +63,53 @@ impl Repository {
         files.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(files)
     }
+
+    /// Per-file line counts for the whole selection, keyed by the path the file list shows.
+    pub fn get_line_stats(&self) -> Result<HashMap<String, LineStat>> {
+        let output = Command::new("jj")
+            .args(["--color=never", "diff"])
+            .args(&self.selection)
+            .arg("--git")
+            .output()
+            .context("Failed to run jj diff --git")?;
+        Ok(parse_git_stats(&String::from_utf8_lossy(&output.stdout)))
+    }
+}
+
+/// Count hunk `+`/`-` lines per file in git-format diff text.
+fn parse_git_stats(text: &str) -> HashMap<String, LineStat> {
+    let mut stats = HashMap::new();
+    let mut current: Option<(String, LineStat)> = None;
+    let mut in_hunk = false;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            stats.extend(current.take());
+            let path = rest.rsplit_once(" b/").map_or(rest, |(_, new)| new);
+            current = Some((path.to_string(), LineStat::default()));
+            in_hunk = false;
+            continue;
+        }
+        let Some((path, stat)) = current.as_mut() else {
+            continue;
+        };
+        if line.starts_with("@@") {
+            in_hunk = true;
+        } else if in_hunk {
+            match line.as_bytes().first() {
+                Some(b'+') => stat.added += 1,
+                Some(b'-') => stat.removed += 1,
+                _ => {}
+            }
+        } else if let Some(new) = line.strip_prefix("rename to ") {
+            *path = new.to_string();
+        } else if let Some(new) = line.strip_prefix("+++ b/") {
+            *path = new.to_string();
+        } else if line.starts_with("Binary files ") {
+            stat.binary = true;
+        }
+    }
+    stats.extend(current);
+    stats
 }
 
 /// Parse one `jj diff --summary` line, e.g. `M path/to/file` or `R old => new`.
@@ -72,4 +128,80 @@ fn parse_summary_line(line: &str) -> Option<ChangedFile> {
         return None;
     }
     Some(ChangedFile { path, status })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_git_stats, LineStat};
+
+    fn stat(added: usize, removed: usize) -> LineStat {
+        LineStat {
+            added,
+            removed,
+            binary: false,
+        }
+    }
+
+    #[test]
+    fn counts_hunk_lines_per_file() {
+        let text = "\
+diff --git a/a.rs b/a.rs
+index 1..2 100644
+--- a/a.rs
++++ b/a.rs
+@@ -1,3 +1,3 @@
+ keep
+-old
++new
++++ added line that looks like a header
+diff --git a/gone.txt b/gone.txt
+deleted file mode 100644
+--- a/gone.txt
++++ /dev/null
+@@ -1,2 +0,0 @@
+-x
+-y
+";
+        let stats = parse_git_stats(text);
+        assert_eq!(stats["a.rs"], stat(2, 1));
+        assert_eq!(stats["gone.txt"], stat(0, 2));
+    }
+
+    #[test]
+    fn rename_is_keyed_by_new_path() {
+        let text = "\
+diff --git a/old.rs b/new.rs
+rename from old.rs
+rename to new.rs
+--- a/old.rs
++++ b/new.rs
+@@ -1 +1 @@
+-a
++b
+";
+        assert_eq!(parse_git_stats(text)["new.rs"], stat(1, 1));
+    }
+
+    #[test]
+    fn binary_file_is_flagged() {
+        let text = "\
+diff --git a/img.png b/img.png
+index 1..2 100644
+Binary files a/img.png and b/img.png differ
+";
+        assert!(parse_git_stats(text)["img.png"].binary);
+    }
+
+    #[test]
+    fn path_with_spaces_comes_from_the_header() {
+        let text = "\
+diff --git a/my dir/b/x.txt b/my dir/b/x.txt
+new file mode 100644
+--- /dev/null
++++ b/my dir/b/x.txt
+@@ -0,0 +1 @@
++hi
+";
+        assert_eq!(parse_git_stats(text)["my dir/b/x.txt"], stat(1, 0));
+    }
 }

@@ -19,7 +19,7 @@ use regex::{Regex, RegexBuilder};
 
 use crate::config::Config;
 use crate::fuzzy::FuzzyMatcher;
-use crate::git::{ChangedFile, FileStatus, Repository};
+use crate::git::{ChangedFile, FileStatus, LineStat, Repository};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -66,7 +66,20 @@ pub struct App {
     content_search: Option<ContentSearch>,
     /// Rendered diffs by path, filled by a search so jumps show exactly what was searched.
     diff_cache: HashMap<String, Vec<Line<'static>>>,
+    /// Whether the file list shows per-file line counts (`s` toggles).
+    show_stats: bool,
+    /// Line counts by path, loaded on first `s` and dropped on reload.
+    line_stats: Option<HashMap<String, LineStat>>,
 }
+
+/// Widest the `+`/`-` bar in the file list grows, matching jj's stat graph scale.
+const STAT_BAR_WIDTH: usize = 40;
+/// Columns before a file list path: two borders, the `> ` highlight, and the status letter.
+const LIST_ROW_OVERHEAD: usize = 6;
+/// Narrowest the path column shrinks to make room for the stat bar.
+const MIN_PATH_WIDTH: usize = 20;
+/// Spaces between the path, counts, and bar columns.
+const STAT_GAP: usize = 2;
 
 impl App {
     pub fn new(selection: Vec<String>) -> Result<Self> {
@@ -109,6 +122,8 @@ impl App {
             pending_search: None,
             content_search: None,
             diff_cache: HashMap::new(),
+            show_stats: false,
+            line_stats: None,
         })
     }
 
@@ -176,11 +191,48 @@ impl App {
             }
         }
 
+        let stats = self.line_stats.as_ref().filter(|_| self.show_stats);
+        let visible_files = || {
+            self.filtered_indices
+                .iter()
+                .filter_map(|&idx| self.files.get(idx))
+        };
+        let file_stat = |file: &ChangedFile| {
+            stats
+                .and_then(|s| s.get(&file.path))
+                .copied()
+                .unwrap_or_default()
+        };
+        let max_changed = visible_files()
+            .map(|f| file_stat(f).added + file_stat(f).removed)
+            .max()
+            .unwrap_or(0);
+        let added_width = visible_files()
+            .map(|f| file_stat(f).added.to_string().len())
+            .max()
+            .unwrap_or(1);
+        let removed_width = visible_files()
+            .map(|f| file_stat(f).removed.to_string().len())
+            .max()
+            .unwrap_or(1);
+        // Counts always fit; the path column gives way next (down to a floor), then the bar.
+        let row_width = (list_area.width as usize).saturating_sub(LIST_ROW_OVERHEAD);
+        let fixed_width = STAT_GAP + added_width + removed_width + 3 + STAT_GAP;
+        let bar_wanted = max_changed.min(STAT_BAR_WIDTH);
+        let longest_path = visible_files()
+            .map(|f| f.path.chars().count())
+            .max()
+            .unwrap_or(0);
+        let path_width = row_width
+            .saturating_sub(fixed_width + bar_wanted)
+            .max(MIN_PATH_WIDTH)
+            .min(longest_path);
+        let bar_width = row_width
+            .saturating_sub(path_width + fixed_width)
+            .min(bar_wanted);
+
         // Build list items from filtered indices
-        let items: Vec<ListItem> = self
-            .filtered_indices
-            .iter()
-            .filter_map(|&idx| self.files.get(idx))
+        let items: Vec<ListItem> = visible_files()
             .zip(&match_counts)
             .map(|(file, &count)| {
                 let status_char = match file.status {
@@ -190,13 +242,25 @@ impl App {
                     FileStatus::Renamed => ("R", Color::Cyan),
                     FileStatus::Untracked => ("?", Color::Gray),
                 };
-                let mut spans = vec![
-                    Span::styled(
-                        format!("{} ", status_char.0),
-                        Style::default().fg(status_char.1),
-                    ),
-                    Span::raw(&file.path),
-                ];
+                let mut spans = vec![Span::styled(
+                    format!("{} ", status_char.0),
+                    Style::default().fg(status_char.1),
+                )];
+                if stats.is_some() {
+                    let path = truncate_start(&file.path, path_width);
+                    let pad = path_width - path.chars().count();
+                    spans.push(Span::raw(path));
+                    spans.push(Span::raw(" ".repeat(pad + STAT_GAP)));
+                    spans.extend(stat_spans(
+                        file_stat(file),
+                        added_width,
+                        removed_width,
+                        max_changed,
+                        bar_width,
+                    ));
+                } else {
+                    spans.push(Span::raw(file.path.clone()));
+                }
                 if count > 0 {
                     spans.push(Span::styled(
                         format!(" ({count})"),
@@ -207,8 +271,13 @@ impl App {
             })
             .collect();
 
+        let totals = stats.map_or(String::new(), |s| {
+            let added: usize = s.values().map(|st| st.added).sum();
+            let removed: usize = s.values().map(|st| st.removed).sum();
+            format!(" +{added} -{removed}")
+        });
         let title = format!(
-            " Changed Files ({}/{}) ",
+            " Changed Files ({}/{}){totals} ",
             self.filtered_indices.len(),
             self.files.len()
         );
@@ -224,15 +293,14 @@ impl App {
         frame.render_stateful_widget(list, list_area, &mut self.list_state);
 
         let help_text = if self.search_mode {
-            " Type to filter | Enter: select | Esc: cancel ".to_string()
+            " Type to filter  Enter select  Esc cancel".to_string()
         } else if let Some(search) = &self.content_search {
             format!(
-                " n/N: next/prev match ({}) | Esc: clear search | l/Enter: view diff | /: search | f: filter | q: quit",
+                " n/N {}  Esc clear  l view  / search  f filter  q quit",
                 search_summary(search)
             )
         } else {
-            " j/k: move | l/Enter: view diff | e: edit | c: copy path | /: search | f: filter | r: reload | q: quit"
-                .to_string()
+            " l view  e edit  c copy  s stats  / search  f filter  r reload  q quit".to_string()
         };
         self.draw_bottom_line(frame, help_area, help_text);
     }
@@ -287,8 +355,8 @@ impl App {
             })
             .collect();
 
-        let mut diff =
-            Paragraph::new(visible_lines).block(Block::default().title(title).borders(Borders::ALL));
+        let mut diff = Paragraph::new(visible_lines)
+            .block(Block::default().title(title).borders(Borders::ALL));
         if self.wrap {
             // `trim: false` keeps leading whitespace so wrapped code stays aligned.
             diff = diff.wrap(Wrap { trim: false });
@@ -314,13 +382,20 @@ impl App {
             );
         }
         let current_line = self.diff_scroll as usize + 1;
-        let position = scroll_position_label(self.diff_scroll as usize, visible_height, total_lines);
+        let position =
+            scroll_position_label(self.diff_scroll as usize, visible_height, total_lines);
+        // Kept within 80 columns; a search drops `r` and `h` to make room for its summary.
         let nav_help = match &self.content_search {
-            Some(search) => format!("n/N: match ({}) | Esc: clear search", search_summary(search)),
-            None => "/: search".to_string(),
+            Some(search) => format!("n/N {}  Esc clear  e edit  c copy", search_summary(search)),
+            None => "/ search  e edit  c copy".to_string(),
+        };
+        let more_help = if self.content_search.is_some() {
+            ""
+        } else {
+            "  r reload  h back"
         };
         let help_text = format!(
-            " {nav_help} | e: edit | c: copy path | w: wrap ({}) | r: reload | Line {}/{} ({}) ",
+            " {nav_help}  w wrap:{}{more_help}  {}/{} {}",
             if self.wrap { "on" } else { "off" },
             current_line.min(total_lines),
             total_lines,
@@ -389,6 +464,7 @@ impl App {
                 }
                 KeyCode::Char('e') => self.open_selected_in_editor(),
                 KeyCode::Char('c') => self.copy_current_path(),
+                KeyCode::Char('s') => self.toggle_stats(),
                 KeyCode::Char('r') => self.refresh(),
                 KeyCode::Enter | KeyCode::Char('l') => self.open_diff(),
                 _ => {}
@@ -542,7 +618,10 @@ impl App {
                     scope.spawn(|| {
                         let mut out = Vec::new();
                         while let Some(path) = paths.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            out.push((path.to_string(), render_diff(path, width, config, &selection)));
+                            out.push((
+                                path.to_string(),
+                                render_diff(path, width, config, &selection),
+                            ));
                         }
                         out
                     })
@@ -732,12 +811,29 @@ impl App {
         false
     }
 
+    fn toggle_stats(&mut self) {
+        self.show_stats = !self.show_stats;
+        if self.show_stats && self.line_stats.is_none() {
+            match self.repository.get_line_stats() {
+                Ok(stats) => self.line_stats = Some(stats),
+                Err(err) => {
+                    self.show_stats = false;
+                    self.status_message = Some(format!("Stats failed: {err}"));
+                }
+            }
+        }
+    }
+
     /// Re-derive the file list and current diff from jj (after an edit or `r`).
     fn refresh(&mut self) {
         let prev_path = self.selected_file.clone();
         let prev_scroll = self.diff_scroll;
         // Drop renders from before the reload; update_filter re-renders them for an active search.
         self.diff_cache.clear();
+        self.line_stats = None;
+        if self.show_stats {
+            self.line_stats = self.repository.get_line_stats().ok();
+        }
 
         if let Ok(files) = self.repository.get_changed_files() {
             self.file_paths = files.iter().map(|f| f.path.clone()).collect();
@@ -890,6 +986,62 @@ fn render_diff(
 }
 
 /// Compile `pattern` case-insensitively unless it has an uppercase letter outside an escape.
+/// `+N -M` counts and a `+++--` bar scaled so the biggest change fills `bar_width`.
+fn stat_spans(
+    stat: LineStat,
+    added_width: usize,
+    removed_width: usize,
+    max_changed: usize,
+    bar_width: usize,
+) -> Vec<Span<'static>> {
+    let green = Style::default().fg(Color::Green);
+    let red = Style::default().fg(Color::Red);
+    if stat.binary {
+        return vec![Span::styled("bin", Style::default().fg(Color::DarkGray))];
+    }
+    let (plus, minus) = stat_bar(stat, max_changed, bar_width);
+    vec![
+        Span::styled(
+            format!("{:>w$}", format!("+{}", stat.added), w = added_width + 1),
+            green,
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!(
+                "{:>w$}",
+                format!("-{}", stat.removed),
+                w = removed_width + 1
+            ),
+            red,
+        ),
+        Span::raw(" ".repeat(STAT_GAP)),
+        Span::styled("+".repeat(plus), green),
+        Span::styled("-".repeat(minus), red),
+    ]
+}
+
+/// Bar lengths for one file; any nonzero side gets at least one cell.
+fn stat_bar(stat: LineStat, max_changed: usize, bar_width: usize) -> (usize, usize) {
+    if bar_width == 0 || max_changed == 0 {
+        return (0, 0);
+    }
+    let scale = |n: usize| match n {
+        0 => 0,
+        n => (n * bar_width).div_ceil(max_changed.max(bar_width)).max(1),
+    };
+    (scale(stat.added), scale(stat.removed))
+}
+
+/// `path` cut to `width` columns from the left, keeping the filename end.
+fn truncate_start(path: &str, width: usize) -> String {
+    let len = path.chars().count();
+    if len <= width {
+        return path.to_string();
+    }
+    let tail: String = path.chars().skip(len + 1 - width.max(1)).collect();
+    format!("…{tail}")
+}
+
 fn smart_case_regex(pattern: &str) -> Result<Regex, regex::Error> {
     let mut escaped = false;
     let has_upper = pattern.chars().any(|c| {
@@ -897,7 +1049,9 @@ fn smart_case_regex(pattern: &str) -> Result<Regex, regex::Error> {
         escaped = !escaped && c == '\\';
         upper
     });
-    RegexBuilder::new(pattern).case_insensitive(!has_upper).build()
+    RegexBuilder::new(pattern)
+        .case_insensitive(!has_upper)
+        .build()
 }
 
 fn line_text(line: &Line) -> String {
@@ -919,8 +1073,14 @@ fn current_match_style() -> Style {
 fn search_summary(search: &ContentSearch) -> String {
     let mut files: Vec<usize> = search.matches.iter().map(|&(pos, _)| pos).collect();
     files.dedup();
-    let current = search.current.map_or("-".to_string(), |i| (i + 1).to_string());
-    format!("{current}/{} in {} files", search.matches.len(), files.len())
+    let current = search
+        .current
+        .map_or("-".to_string(), |i| (i + 1).to_string());
+    format!(
+        "{current}/{} in {} files",
+        search.matches.len(),
+        files.len()
+    )
 }
 
 /// Index of the first match after `cursor` (or last before it when `!forward`), wrapping
@@ -971,7 +1131,10 @@ fn highlight_matches(line: &Line<'static>, regex: &Regex, style: Style) -> Line<
             if s > cut {
                 spans.push(Span::styled(text[cut..s].to_string(), span.style));
             }
-            spans.push(Span::styled(text[s..e].to_string(), span.style.patch(style)));
+            spans.push(Span::styled(
+                text[s..e].to_string(),
+                span.style.patch(style),
+            ));
             cut = e;
         }
         if end > cut {
@@ -1030,7 +1193,10 @@ fn copy_to_clipboard(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_match, highlight_matches, line_text, smart_case_regex};
+    use super::{
+        find_match, highlight_matches, line_text, smart_case_regex, stat_bar, truncate_start,
+    };
+    use crate::git::LineStat;
     use ratatui::style::{Color, Style};
     use ratatui::text::{Line, Span};
     use regex::Regex;
@@ -1078,14 +1244,38 @@ mod tests {
     }
 
     #[test]
+    fn stat_bar_is_unscaled_when_small_and_scaled_when_large() {
+        let stat = |added, removed| LineStat {
+            added,
+            removed,
+            binary: false,
+        };
+        assert_eq!(stat_bar(stat(3, 2), 10, 40), (3, 2));
+        assert_eq!(stat_bar(stat(400, 0), 400, 40), (40, 0));
+        assert_eq!(stat_bar(stat(400, 0), 400, 10), (10, 0));
+        // A tiny change next to a huge one still gets one cell per side.
+        assert_eq!(stat_bar(stat(1, 1), 1000, 40), (1, 1));
+        assert_eq!(stat_bar(stat(5, 5), 10, 0), (0, 0));
+    }
+
+    #[test]
+    fn truncate_start_keeps_the_filename_end() {
+        assert_eq!(truncate_start("src/app.rs", 20), "src/app.rs");
+        assert_eq!(truncate_start("src/git/repository.rs", 12), "…pository.rs");
+    }
+
+    #[test]
     fn highlight_splits_spans_and_keeps_text() {
         let red = Style::default().fg(Color::Red);
         let line = Line::from(vec![Span::styled("foo b", red), Span::raw("ar baz")]);
         let hl = Style::default().bg(Color::Yellow);
         let out = highlight_matches(&line, &Regex::new("bar").unwrap(), hl);
         assert_eq!(line_text(&out), "foo bar baz");
-        let styled: Vec<(&str, Style)> =
-            out.spans.iter().map(|s| (s.content.as_ref(), s.style)).collect();
+        let styled: Vec<(&str, Style)> = out
+            .spans
+            .iter()
+            .map(|s| (s.content.as_ref(), s.style))
+            .collect();
         assert_eq!(
             styled,
             vec![
