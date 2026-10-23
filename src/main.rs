@@ -3,9 +3,13 @@ mod config;
 mod fuzzy;
 mod git;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{ArgAction, Parser};
+use std::io::Read;
 use std::panic;
+use std::sync::Arc;
+
+use git::{Patch, Source};
 
 /// A terminal-based Git diff viewer with fuzzy search
 #[derive(Parser)]
@@ -64,6 +68,15 @@ struct Cli {
     #[arg(short = 't', long, value_name = "REV")]
     to: Option<String>,
 
+    /// Read a git-format patch from FILE (`-` for stdin) instead of a jj repo
+    #[arg(
+        short = 'p',
+        long,
+        value_name = "FILE",
+        conflicts_with_all = ["revisions", "from", "to", "ignore_all_space", "ignore_space_change", "context"]
+    )]
+    patch: Option<String>,
+
     /// Ignore whitespace entirely when comparing lines (passed to `jj diff -w`)
     #[arg(short = 'w', long = "ignore-all-space")]
     ignore_all_space: bool,
@@ -84,6 +97,20 @@ struct Cli {
 impl Cli {
     /// jj selection args shared by the file-list summary and per-file diff calls.
     /// Empty (no flags) means the working copy, like a bare `jj diff`.
+    fn source(&self) -> Result<Source> {
+        if let Some(path) = &self.patch {
+            let mut text = String::new();
+            if path == "-" {
+                std::io::stdin().read_to_string(&mut text)?;
+            } else {
+                text = std::fs::read_to_string(path)
+                    .with_context(|| format!("Failed to read patch {path}"))?;
+            }
+            return Ok(Source::Patch(Arc::new(Patch::parse(text))));
+        }
+        Ok(Source::Jj(self.selection()))
+    }
+
     fn selection(&self) -> Vec<String> {
         let mut args = Vec::new();
         if let Some(r) = &self.revisions {
@@ -121,7 +148,7 @@ fn main() -> Result<()> {
         original_hook(panic_info);
     }));
 
-    let app = app::App::new(cli.selection())?;
+    let app = app::App::new(cli.source()?)?;
 
     let terminal = ratatui::init();
     let result = app.run(terminal);

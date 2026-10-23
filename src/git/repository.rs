@@ -2,6 +2,8 @@ use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::process::Command;
 
+use super::Source;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileStatus {
     Modified,
@@ -27,15 +29,17 @@ pub struct ChangedFile {
     pub status: FileStatus,
 }
 
-/// A jj-backed source of changed files. `selection` holds the jj revset args
-/// (e.g. `["--from", "x", "--to", "y"]`) shared with the per-file diff calls;
-/// empty means the working copy.
+/// A source of changed files: jj revset args (e.g. `["--from", "x", "--to", "y"]`)
+/// shared with the per-file diff calls (empty means the working copy), or a patch.
 pub struct Repository {
-    selection: Vec<String>,
+    source: Source,
 }
 
 impl Repository {
-    pub fn open(selection: Vec<String>) -> Result<Self> {
+    pub fn open(source: Source) -> Result<Self> {
+        if source.is_patch() {
+            return Ok(Self { source });
+        }
         let ok = Command::new("jj")
             .arg("root")
             .output()
@@ -45,13 +49,17 @@ impl Repository {
         if !ok {
             bail!("Not a jj repository. Please run this command inside a jj repository.");
         }
-        Ok(Self { selection })
+        Ok(Self { source })
     }
 
     pub fn get_changed_files(&self) -> Result<Vec<ChangedFile>> {
+        let selection = match &self.source {
+            Source::Jj(args) => args,
+            Source::Patch(patch) => return Ok(patch.files()),
+        };
         let output = Command::new("jj")
             .arg("diff")
-            .args(&self.selection)
+            .args(selection)
             .arg("--summary")
             .output()
             .context("Failed to run jj diff --summary")?;
@@ -66,9 +74,13 @@ impl Repository {
 
     /// Per-file line counts for the whole selection, keyed by the path the file list shows.
     pub fn get_line_stats(&self) -> Result<HashMap<String, LineStat>> {
+        let selection = match &self.source {
+            Source::Jj(args) => args,
+            Source::Patch(patch) => return Ok(parse_git_stats(patch.text())),
+        };
         let output = Command::new("jj")
             .args(["--color=never", "diff"])
-            .args(&self.selection)
+            .args(selection)
             .arg("--git")
             .output()
             .context("Failed to run jj diff --git")?;

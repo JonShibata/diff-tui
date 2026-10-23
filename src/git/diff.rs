@@ -1,27 +1,28 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+use super::Source;
 use crate::config::DiffConfig;
 
-pub fn get_diff(file_path: &str, width: u16, config: &DiffConfig, selection: &[String]) -> Vec<u8> {
+pub fn get_diff(file_path: &str, width: u16, config: &DiffConfig, source: &Source) -> Vec<u8> {
     match config.tool.as_str() {
         "auto" => {
             // Try delta first, then fall back to jj's own colored diff
-            if let Ok(output) = try_tool("delta", file_path, width, &["--width"], selection) {
+            if let Ok(output) = try_tool("delta", file_path, width, &["--width"], source) {
                 return output;
             }
-            try_jj_color_diff(file_path, selection).unwrap_or_else(|_| b"Failed to get diff".to_vec())
+            try_jj_color_diff(file_path, source).unwrap_or_else(|_| b"Failed to get diff".to_vec())
         }
         "jj" | "git" => {
-            try_jj_color_diff(file_path, selection).unwrap_or_else(|_| b"Failed to get diff".to_vec())
+            try_jj_color_diff(file_path, source).unwrap_or_else(|_| b"Failed to get diff".to_vec())
         }
         tool => {
             // Try the specified tool
-            if let Ok(output) = try_tool(tool, file_path, width, &config.args, selection) {
+            if let Ok(output) = try_tool(tool, file_path, width, &config.args, source) {
                 return output;
             }
             // Fallback to jj's own colored diff
-            try_jj_color_diff(file_path, selection).unwrap_or_else(|_| b"Failed to get diff".to_vec())
+            try_jj_color_diff(file_path, source).unwrap_or_else(|_| b"Failed to get diff".to_vec())
         }
     }
 }
@@ -32,8 +33,8 @@ pub fn get_diff(file_path: &str, width: u16, config: &DiffConfig, selection: &[S
 /// changed line: context and addition lines get their own new-file line
 /// number, and a deletion gets the line number of whatever now occupies its
 /// position (the following context/addition line, or one past the hunk's end).
-pub fn hunk_line_targets(file_path: &str, selection: &[String]) -> Vec<Vec<u32>> {
-    let raw = get_jj_diff_output(file_path, selection).unwrap_or_default();
+pub fn hunk_line_targets(file_path: &str, source: &Source) -> Vec<Vec<u32>> {
+    let raw = get_jj_diff_output(file_path, source).unwrap_or_default();
     parse_hunk_line_targets(&String::from_utf8_lossy(&raw))
 }
 
@@ -93,7 +94,7 @@ fn try_tool(
     file_path: &str,
     width: u16,
     extra_args: &[impl AsRef<str>],
-    selection: &[String],
+    source: &Source,
 ) -> Result<Vec<u8>, ()> {
     // Check if the tool is available
     if which::which(tool_name).is_err() {
@@ -101,7 +102,7 @@ fn try_tool(
     }
 
     // Get the (uncolored) git-format diff first
-    let diff_input = get_jj_diff_output(file_path, selection)?;
+    let diff_input = get_jj_diff_output(file_path, source)?;
 
     if diff_input.is_empty() {
         return Err(());
@@ -164,7 +165,11 @@ fn fileset_literal(file_path: &str) -> String {
 }
 
 /// Uncolored git-format diff for one file (jj disables color when piped).
-fn get_jj_diff_output(file_path: &str, selection: &[String]) -> Result<Vec<u8>, ()> {
+fn get_jj_diff_output(file_path: &str, source: &Source) -> Result<Vec<u8>, ()> {
+    let selection = match source {
+        Source::Jj(args) => args,
+        Source::Patch(patch) => return Ok(patch.file_diff(file_path).as_bytes().to_vec()),
+    };
     let output = Command::new("jj")
         .arg("diff")
         .args(selection)
@@ -178,7 +183,11 @@ fn get_jj_diff_output(file_path: &str, selection: &[String]) -> Result<Vec<u8>, 
 }
 
 /// Fallback when no external diff tool is available: jj's own colored git-format diff.
-fn try_jj_color_diff(file_path: &str, selection: &[String]) -> Result<Vec<u8>, ()> {
+fn try_jj_color_diff(file_path: &str, source: &Source) -> Result<Vec<u8>, ()> {
+    let selection = match source {
+        Source::Jj(args) => args,
+        Source::Patch(patch) => return Ok(patch.file_diff(file_path).as_bytes().to_vec()),
+    };
     let output = Command::new("jj")
         .args(["--color=always", "diff"])
         .args(selection)

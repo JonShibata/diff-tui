@@ -74,6 +74,14 @@ Run inside a Git repository:
 diff-tui
 ```
 
+### Viewing a patch
+
+Pass `--patch FILE` (or `-` for stdin) to browse a git-format diff without a jj repo. Editing (`e`) is disabled in this mode.
+
+```bash
+gh pr diff 123 | diff-tui --patch -
+```
+
 ### Key Bindings
 
 #### File Selection

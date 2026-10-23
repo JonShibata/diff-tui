@@ -19,7 +19,7 @@ use regex::{Regex, RegexBuilder};
 
 use crate::config::Config;
 use crate::fuzzy::FuzzyMatcher;
-use crate::git::{ChangedFile, FileStatus, LineStat, Repository};
+use crate::git::{ChangedFile, FileStatus, LineStat, Repository, Source};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -53,7 +53,7 @@ pub struct App {
     pub config: Config,
     pub needs_redraw: bool,
     repository: Repository,
-    selection: Vec<String>,
+    source: Source,
     /// New-file line number for each rendered row of the open diff, `None` for
     /// rows that aren't a hunk body line (file/hunk headers, separator rules).
     line_numbers: Vec<Option<u32>>,
@@ -82,9 +82,9 @@ const MIN_PATH_WIDTH: usize = 20;
 const STAT_GAP: usize = 2;
 
 impl App {
-    pub fn new(selection: Vec<String>) -> Result<Self> {
+    pub fn new(source: Source) -> Result<Self> {
         let config = Config::load();
-        let repository = Repository::open(selection.clone())?;
+        let repository = Repository::open(source.clone())?;
         let files = repository.get_changed_files()?;
         let file_paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
         let filtered_indices: Vec<usize> = (0..files.len()).collect();
@@ -115,7 +115,7 @@ impl App {
             config,
             needs_redraw: false,
             repository,
-            selection,
+            source,
             line_numbers: Vec::new(),
             status_message: None,
             search_prompt: None,
@@ -606,8 +606,7 @@ impl App {
         let width = diff_width();
         let config = &self.config.diff;
         // The file list already snapshotted; skipping the snapshot lets jj run concurrently.
-        let mut selection = self.selection.clone();
-        selection.push("--ignore-working-copy".to_string());
+        let source = self.source.without_snapshot();
         let next = AtomicUsize::new(0);
         let threads = std::thread::available_parallelism()
             .map_or(4, |n| n.get())
@@ -620,7 +619,7 @@ impl App {
                         while let Some(path) = paths.get(next.fetch_add(1, Ordering::Relaxed)) {
                             out.push((
                                 path.to_string(),
-                                render_diff(path, width, config, &selection),
+                                render_diff(path, width, config, &source),
                             ));
                         }
                         out
@@ -776,7 +775,7 @@ impl App {
                             &file.path,
                             diff_width(),
                             &self.config.diff,
-                            &self.selection,
+                            &self.source,
                         ),
                     };
 
@@ -784,7 +783,7 @@ impl App {
                     // `e` can open the editor at whatever line is at the top of the
                     // current scroll position, not just the hunk's first change. Each
                     // hunk's body starts right after its rendered separator rule.
-                    let hunk_targets = crate::git::hunk_line_targets(&file.path, &self.selection);
+                    let hunk_targets = crate::git::hunk_line_targets(&file.path, &self.source);
                     let mut targets = hunk_targets.into_iter();
                     let mut current_hunk: Option<std::vec::IntoIter<u32>> = None;
                     self.line_numbers = self
@@ -899,6 +898,10 @@ impl App {
     }
 
     fn open_in_editor(&mut self) {
+        if self.source.is_patch() {
+            self.status_message = Some("Editing is unavailable when viewing a patch".to_string());
+            return;
+        }
         let line = self.current_hunk_line();
         let Some(file_path) = self.selected_file.clone() else {
             return;
@@ -961,9 +964,9 @@ fn render_diff(
     path: &str,
     width: u16,
     config: &crate::config::DiffConfig,
-    selection: &[String],
+    source: &Source,
 ) -> Vec<Line<'static>> {
-    let content = crate::git::get_diff(path, width, config, selection);
+    let content = crate::git::get_diff(path, width, config, source);
     match content.as_slice().into_text() {
         Ok(text) => text
             .lines
